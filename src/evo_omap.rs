@@ -257,20 +257,6 @@ impl LightDataset {
     }
 }
 
-impl DatasetLike for LightDataset {
-    fn get(&self, _index: usize) -> &[u8] {
-        unreachable!("LightDataset does not support DatasetLike::get, use get_node")
-    }
-
-    fn set(&mut self, _index: usize, _node: Vec<u8>) {
-        unreachable!("LightDataset does not support DatasetLike::set, use set_node")
-    }
-
-    fn as_node_slice(&self) -> Vec<&[u8]> {
-        unreachable!("LightDataset does not support slice export")
-    }
-}
-
 pub fn evo_omap_hash_light(
     dataset: &mut LightDataset,
     header: &[u8],
@@ -670,7 +656,6 @@ pub fn verify_light(
         return false;
     }
     let epoch_seed = compute_epoch_seed(height);
-    let _cache = generate_cache(&epoch_seed);
     let mut dataset = LightDataset::new(&epoch_seed);
 
     let pow_hash = evo_omap_hash_light(&mut dataset, header, height, nonce);
