@@ -34,7 +34,7 @@ impl State {
     pub fn as_u64_array(&self) -> [u64; 8] {
         let mut arr = [0u64; 8];
         for i in 0..8 {
-            arr[i] = u64::from_be_bytes([
+            arr[i] = u64::from_le_bytes([
                 self.0[i * 8],
                 self.0[i * 8 + 1],
                 self.0[i * 8 + 2],
@@ -48,18 +48,20 @@ impl State {
         arr
     }
 
-    pub fn as_u64_mut_array(&mut self) -> &mut [u64; 8] {
-        let ptr = self.0.as_mut_ptr();
+    pub fn as_u64_mut_array(&mut self) -> &mut [u64] {
+        let ptr = self.0.as_mut_ptr() as *mut u64;
         assert_eq!(
-            ptr.align_offset(8), 0,
+            self.0.as_ptr().align_offset(8), 0,
             "State buffer must be 8-byte aligned for u64 access"
         );
-        unsafe { &mut *(ptr as *mut [u64; 8]) }
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr, 8)
+        }
     }
 
     pub fn set_u64_at_index(&mut self, index: usize, value: u64) {
         let bytes = &mut self.0[index * 8..index * 8 + 8];
-        bytes.copy_from_slice(&value.to_be_bytes());
+        bytes.copy_from_slice(&value.to_le_bytes());
     }
 
     pub fn as_bytes(&self) -> &[u8; STATE_SIZE_SPEC] {
@@ -320,9 +322,9 @@ pub fn generate_program(state: &State) -> Program {
 
 pub fn derive_indices(state: &State, step: u64) -> (usize, usize, usize) {
     let words = state.as_u64_array();
-    let idx1 = words[0].wrapping_add(step) as usize % NUM_NODES;
-    let idx2 = words[1].wrapping_mul(step.wrapping_add(1)) as usize % NUM_NODES;
-    let idx_write = (words[2] ^ words[3]) as usize % NUM_NODES;
+    let idx1 = (words[0].wrapping_add(step) % NUM_NODES as u64) as usize;
+    let idx2 = (words[1].wrapping_mul(step.wrapping_add(1)) % NUM_NODES as u64) as usize;
+    let idx_write = ((words[2] ^ words[3]) % NUM_NODES as u64) as usize;
     (idx1, idx2, idx_write)
 }
 
@@ -335,7 +337,7 @@ fn node_as_u64_array(node: &[u8]) -> Vec<u64> {
     let mut words = Vec::with_capacity(word_count);
     for i in 0..word_count {
         let bytes = &node[i * 8..i * 8 + 8];
-        words.push(u64::from_be_bytes(bytes.try_into().unwrap()));
+        words.push(u64::from_le_bytes(bytes.try_into().unwrap()));
     }
     words
 }
@@ -498,6 +500,9 @@ pub fn mine(
     difficulty: u64,
     max_nonce_attempts: u64,
 ) -> Option<u64> {
+    if difficulty == 0 {
+        return None;
+    }
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = generate_dataset(&epoch_seed);
     let target = u64::MAX / difficulty;
@@ -524,6 +529,9 @@ pub fn verify(
     nonce: u64,
     difficulty: u64,
 ) -> bool {
+    if difficulty == 0 {
+        return false;
+    }
     let epoch_seed = compute_epoch_seed(height);
     let mut dataset = generate_dataset(&epoch_seed);
     let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
@@ -538,6 +546,9 @@ pub fn verify_light(
     nonce: u64,
     difficulty: u64,
 ) -> bool {
+    if difficulty == 0 {
+        return false;
+    }
     let epoch_seed = compute_epoch_seed(height);
     let cache = generate_cache(&epoch_seed);
     let mut dataset = Dataset::new();

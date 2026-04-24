@@ -62,12 +62,6 @@ pub const NUM_REGISTERS: usize = 8;
 /// This is a cache-friendly design choice for light verification.
 pub const OPERAND_WORDS: usize = 128;
 
-/// Rotation amount bit mask (6 bits for 64-bit rotate, values 0-63).
-///
-/// Rotation amounts are computed as (state[dst] & ROTATION_MASK) + imm,
-/// giving data-dependent but bounded rotation amounts.
-pub const ROTATION_MASK: u64 = 0x3F;
-
 /// Minimum program length (instructions per step).
 pub const PROGRAM_LENGTH_MIN: usize = 4;
 
@@ -140,7 +134,7 @@ impl Instruction {
     /// - All arithmetic uses wrapping to prevent overflow attacks
     /// - Rotation amounts are data-dependent: node_word[src % OPERAND_WORDS] % 64
     /// - All arithmetic/logic instructions access node data for memory-hardness
-    pub fn execute(&self, state: &mut [u64; 8], node1_words: &[u64], node2_words: &[u64]) {
+    pub fn execute(&self, state: &mut [u64], node1_words: &[u64], node2_words: &[u64]) {
         match self {
             Instruction::Add { dst, src } => {
                 let operand = node1_words[(*src as usize) % OPERAND_WORDS];

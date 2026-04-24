@@ -6,7 +6,6 @@
 // Re-export algorithm-level constants from public_spec
 pub use crate::public_spec::NUM_REGISTERS;
 pub use crate::public_spec::OPERAND_WORDS;
-pub use crate::public_spec::ROTATION_MASK;
 pub use crate::public_spec::STATE_SIZE;
 
 // =============================================================================
@@ -57,12 +56,6 @@ pub const SELECTOR_DST_SHIFT: usize = 16;
 
 /// Bit shift for source register field (7 bits for operand index 0-127).
 pub const SELECTOR_SRC_SHIFT: usize = 19;
-
-/// Bit shift for immediate value field.
-pub const SELECTOR_IMM_SHIFT: usize = 26;
-
-/// Immediate value bit mask (6 bits, values 0-63).
-pub const IMM_MASK: u64 = 0x3F;
 
 // =============================================================================
 // Branch Parameters

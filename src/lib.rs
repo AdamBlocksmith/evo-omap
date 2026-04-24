@@ -1,6 +1,5 @@
 pub mod hash;
 pub mod public_spec;
-pub mod private_tuning;
 pub mod constants;
 pub mod evo_omap;
 
