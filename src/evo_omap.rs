@@ -199,39 +199,71 @@ impl<'a> DatasetLike for CowDataset<'a> {
 
 pub struct LightDataset {
     epoch_seed: Hash,
+    original_nodes: Vec<Option<Vec<u8>>>,
+    modified_nodes: Vec<Option<Vec<u8>>>,
 }
 
 impl LightDataset {
     pub fn new(epoch_seed: &Hash) -> Self {
         Self {
             epoch_seed: *epoch_seed,
+            original_nodes: vec![None; NUM_NODES],
+            modified_nodes: vec![None; NUM_NODES],
         }
     }
 
-    fn reconstruct_node(&self, index: usize) -> Vec<u8> {
-        let prev_node = if index == 0 {
-            Vec::new()
-        } else {
-            self.reconstruct_node(index - 1)
-        };
+    fn reconstruct_node_raw(&self, prev_node: &[u8], index: usize) -> Vec<u8> {
         let index_bytes = (index as u64).to_le_bytes();
         let epoch_seed_bytes = self.epoch_seed.as_ref();
         let mut data = Vec::with_capacity(48 + NODE_SIZE);
         data.extend_from_slice(DOMAIN_NODE);
         data.extend_from_slice(epoch_seed_bytes);
-        data.extend_from_slice(&prev_node);
+        data.extend_from_slice(prev_node);
         data.extend_from_slice(&index_bytes);
         blake3_xof(&data, NODE_SIZE)
+    }
+
+    pub fn get_node(&mut self, index: usize) -> Vec<u8> {
+        if let Some(ref node) = self.modified_nodes[index] {
+            return node.clone();
+        }
+        if self.original_nodes[index].is_none() {
+            let prev_node = if index == 0 {
+                Vec::new()
+            } else {
+                self.get_node(index - 1)
+            };
+            let node = self.reconstruct_node_raw(&prev_node, index);
+            self.original_nodes[index] = Some(node);
+        }
+        self.original_nodes[index].as_ref().unwrap().clone()
+    }
+
+    pub fn set_node(&mut self, index: usize, node: Vec<u8>) {
+        self.modified_nodes[index] = Some(node);
+    }
+
+    pub fn compute_memory_commitment(&mut self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DOMAIN_MEMORY);
+        for i in 0..NUM_NODES {
+            let node = self.get_node(i);
+            hasher.update(&node);
+        }
+        let result = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(result.as_bytes());
+        Hash(arr)
     }
 }
 
 impl DatasetLike for LightDataset {
     fn get(&self, _index: usize) -> &[u8] {
-        unreachable!("LightDataset does not support direct access, use reconstruct_node")
+        unreachable!("LightDataset does not support DatasetLike::get, use get_node")
     }
 
     fn set(&mut self, _index: usize, _node: Vec<u8>) {
-        unreachable!("LightDataset does not support writes")
+        unreachable!("LightDataset does not support DatasetLike::set, use set_node")
     }
 
     fn as_node_slice(&self) -> Vec<&[u8]> {
@@ -257,8 +289,8 @@ pub fn evo_omap_hash_light(
         let program = generate_program(&state);
         let (idx1, idx2, idx_write) = derive_indices(&state, step as u64);
 
-        let node1 = dataset.reconstruct_node(idx1);
-        let node2 = dataset.reconstruct_node(idx2);
+        let node1 = dataset.get_node(idx1);
+        let node2 = dataset.get_node(idx2);
 
         execute_program(&mut state, &program, &node1, &node2);
 
@@ -270,7 +302,7 @@ pub fn evo_omap_hash_light(
         write_data.extend_from_slice(&node2[..WRITE_NODE_PREFIX]);
         write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
         let written = blake3_xof(&write_data, NODE_SIZE);
-        dataset.set(idx_write, written);
+        dataset.set_node(idx_write, written);
 
         commitment_hash = blake3_256(
             &commitment_hash
@@ -294,21 +326,6 @@ pub fn evo_omap_hash_light(
         .collect();
 
     sha3_256(&final_input)
-}
-
-impl LightDataset {
-    fn compute_memory_commitment(&self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(DOMAIN_MEMORY);
-        for i in 0..NUM_NODES {
-            let node = self.reconstruct_node(i);
-            hasher.update(&node);
-        }
-        let result = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(result.as_bytes());
-        Hash(arr)
-    }
 }
 
 fn compute_epoch_number(height: u64) -> u64 {

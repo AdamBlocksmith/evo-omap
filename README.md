@@ -115,17 +115,17 @@ At each of `T = 4096` steps:
    - variant 3: state ‖ node2[0..32] ‖ node1[0..32] ‖ node2[0..32]
    output = XOF(input, 64)
    for j = 0 to 7: wⱼ = wⱼ ⊕ output[j×8:(j+1)×8]
-   ```
+    ```
 
 5. **Node Write**: Compute and store written node:
    ```
-   write_data = node1[0..8192] ‖ w[0..4]
+   write_data = node1[0..8192] ‖ node2[0..8192] ‖ state[0..32]
    Node[idx_w] = XOF(write_data, S)
    ```
 
 6. **Commitment Update**:
    ```
-   commitment = H(commitment ‖ w[0..4])
+   commitment = H(commitment ‖ step ‖ state[0..4])
    ```
 
 ### Finalization
