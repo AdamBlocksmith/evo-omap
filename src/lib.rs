@@ -6,11 +6,13 @@ pub mod evo_omap;
 pub use hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 
 pub use evo_omap::{
-    State, Instruction, Program, Dataset, Cache,
+    State, Instruction, Program, Dataset, Cache, CowDataset,
     compute_epoch_seed,
-    evo_omap_hash, mine, verify, verify_light,
-    derive_indices, execute_program, apply_branch, generate_program,
+    evo_omap_hash, evo_omap_hash_with_buffers,
+    mine, mine_parallel, verify, verify_light,
+    derive_indices, execute_program, apply_branch, apply_branch_with_buffer, generate_program,
     compute_memory_commitment, generate_dataset, generate_cache,
+    DatasetCache, HashBuffers,
     DatasetSpec, CacheSpec,
     STATE_SIZE_SPEC,
     PROGRAM_LENGTH_MIN, PROGRAM_LENGTH_MAX,
@@ -20,3 +22,6 @@ pub use evo_omap::{
     DOMAIN_EPOCH, DOMAIN_NODE, DOMAIN_SEED,
     DOMAIN_CACHE, DOMAIN_BRANCH, DOMAIN_COMMITMENT, DOMAIN_MEMORY,
 };
+
+pub use rayon::prelude::*;
+pub use rayon::current_num_threads;

@@ -9,6 +9,7 @@ description = "EVO-OMAP: Execution-based, memory-hard proof-of-work algorithm"
 blake3 = "1.8"
 sha3 = "0.10"
 hex = "0.4"
+rayon = "1.10"
 
 [dev-dependencies]
 rand = "0.9"

@@ -3,6 +3,8 @@
 //! This module implements the EVO-OMAP algorithm. Protocol constants are
 //! defined in constants.rs. Public specification is in public_spec.rs.
 
+use std::sync::Arc;
+
 pub use crate::hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 pub use crate::public_spec::{
     Instruction, Program,
@@ -600,6 +602,140 @@ pub fn evo_omap_hash<D: DatasetLike>(
     sha3_256(&final_input)
 }
 
+pub struct HashBuffers {
+    pub commitment_data: Vec<u8>,
+    pub write_data: Vec<u8>,
+    pub branch_input: Vec<u8>,
+    pub commitment_input: Vec<u8>,
+    pub final_input: Vec<u8>,
+}
+
+impl HashBuffers {
+    pub fn new() -> Self {
+        Self {
+            commitment_data: Vec::with_capacity(40),
+            write_data: Vec::with_capacity(WRITE_NODE_PREFIX * 2 + STATE_HASH_PREFIX),
+            branch_input: Vec::with_capacity(16 + 32 + 64 + 32 + 32),
+            commitment_input: Vec::with_capacity(32 + 8 + 32),
+            final_input: Vec::with_capacity(32 + 32 + 32),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.commitment_data.clear();
+        self.write_data.clear();
+        self.branch_input.clear();
+        self.commitment_input.clear();
+        self.final_input.clear();
+    }
+}
+
+impl Default for HashBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
+    dataset: &mut D,
+    header: &[u8],
+    height: u64,
+    nonce: u64,
+    buffers: &mut HashBuffers,
+) -> Hash {
+    let seed = compute_mining_seed(header, height, nonce);
+    let mut state = State::from_seed(&seed);
+
+    buffers.commitment_data.clear();
+    buffers.commitment_data.extend_from_slice(DOMAIN_COMMITMENT);
+    buffers.commitment_data.extend_from_slice(&height.to_le_bytes());
+    let mut commitment_hash = blake3_256(&buffers.commitment_data);
+
+    for step in 0..NUM_STEPS {
+        let program = generate_program(&state);
+        let (idx1, idx2, idx_write) = derive_indices(&state, step as u64);
+
+        let node1 = dataset.get(idx1).to_vec();
+        let node2 = dataset.get(idx2).to_vec();
+
+        execute_program(&mut state, &program, &node1, &node2);
+
+        apply_branch_with_buffer(&mut state, step as u32, &node1, &node2, &mut buffers.branch_input);
+
+        let state_bytes = state.as_bytes();
+        buffers.write_data.clear();
+        buffers.write_data.extend_from_slice(&node1[..WRITE_NODE_PREFIX]);
+        buffers.write_data.extend_from_slice(&node2[..WRITE_NODE_PREFIX]);
+        buffers.write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
+        let written = blake3_xof(&buffers.write_data, NODE_SIZE);
+        dataset.set(idx_write, written);
+
+        buffers.commitment_input.clear();
+        buffers.commitment_input.extend_from_slice(commitment_hash.as_ref());
+        buffers.commitment_input.extend_from_slice(&(step as u64).to_le_bytes());
+        buffers.commitment_input.extend_from_slice(&state_bytes[..32]);
+        commitment_hash = blake3_256(&buffers.commitment_input);
+    }
+
+    let state_summary = blake3_256(state.as_bytes());
+    let nodes = dataset.as_node_slice();
+    let memory_commitment = compute_memory_commitment_from_slice(&nodes);
+    buffers.final_input.clear();
+    buffers.final_input.extend_from_slice(state_summary.as_ref());
+    buffers.final_input.extend_from_slice(commitment_hash.as_ref());
+    buffers.final_input.extend_from_slice(memory_commitment.as_ref());
+
+    sha3_256(&buffers.final_input)
+}
+
+pub fn apply_branch_with_buffer(
+    state: &mut State,
+    step: u32,
+    node1: &[u8],
+    node2: &[u8],
+    input: &mut Vec<u8>,
+) {
+    let words = state.as_u64_array();
+    let branch_variant = (words[0] & BRANCH_MASK) as u8;
+    let state_bytes = state.as_bytes();
+
+    input.clear();
+    input.extend_from_slice(DOMAIN_BRANCH);
+    input.extend_from_slice(&step.to_le_bytes());
+    input.push(branch_variant);
+    match branch_variant {
+        0 => {
+            input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+        }
+        1 => {
+            input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+        }
+        2 => {
+            input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+        }
+        3 => {
+            input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+        }
+        _ => unreachable!(),
+    }
+
+    let output = blake3_xof(input, STATE_SIZE_SPEC);
+    let mut state_arr = state.as_u64_array();
+    for i in 0..NUM_REGISTERS {
+        let xor_val = u64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+        state_arr[i] ^= xor_val;
+    }
+    state.write_all_u64(&state_arr);
+}
+
 pub fn mine(
     header: &[u8],
     height: u64,
@@ -614,11 +750,12 @@ pub fn mine(
     let target = u64::MAX / difficulty;
 
     let mut cow_dataset = CowDataset::new(&base_dataset);
+    let mut buffers = HashBuffers::new();
 
     for nonce in 0..max_nonce_attempts {
         cow_dataset.reset();
 
-        let pow_hash = evo_omap_hash(&mut cow_dataset, header, height, nonce);
+        let pow_hash = evo_omap_hash_with_buffers(&mut cow_dataset, header, height, nonce, &mut buffers);
 
         let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
         if hash_int < target {
@@ -627,6 +764,78 @@ pub fn mine(
     }
 
     None
+}
+
+use rayon::prelude::*;
+
+pub fn mine_parallel(
+    header: &[u8],
+    height: u64,
+    difficulty: u64,
+    max_nonce_attempts: u64,
+    num_threads: usize,
+) -> Option<u64> {
+    if difficulty == 0 {
+        return None;
+    }
+    let epoch_seed = compute_epoch_seed(height);
+    let base_dataset = Arc::new(generate_dataset(&epoch_seed));
+    let target = u64::MAX / difficulty;
+    let header = header.to_vec();
+
+    let chunks: Vec<(u64, u64)> = (0..max_nonce_attempts)
+        .collect::<Vec<_>>()
+        .chunks((max_nonce_attempts / num_threads as u64).max(1) as usize)
+        .map(|chunk| (*chunk.first().unwrap(), *chunk.last().unwrap() + 1))
+        .collect();
+
+    chunks
+        .into_par_iter()
+        .find_map_any(|(start_nonce, end_nonce)| {
+            let mut buffers = HashBuffers::new();
+
+            for nonce in start_nonce..end_nonce {
+                let mut dataset = CowDataset::new(&base_dataset);
+
+                let pow_hash = evo_omap_hash_with_buffers(&mut dataset, &header, height, nonce, &mut buffers);
+
+                let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
+                if hash_int < target {
+                    return Some(nonce);
+                }
+            }
+            None
+        })
+}
+
+pub struct DatasetCache {
+    epoch: u64,
+    dataset: Dataset,
+}
+
+impl DatasetCache {
+    pub fn new() -> Self {
+        Self {
+            epoch: u64::MAX,
+            dataset: Dataset::new(),
+        }
+    }
+
+    pub fn get_dataset(&mut self, height: u64) -> &Dataset {
+        let epoch = compute_epoch_number(height);
+        if self.epoch != epoch {
+            let epoch_seed = compute_epoch_seed(height);
+            self.dataset = generate_dataset(&epoch_seed);
+            self.epoch = epoch;
+        }
+        &self.dataset
+    }
+}
+
+impl Default for DatasetCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn verify(
