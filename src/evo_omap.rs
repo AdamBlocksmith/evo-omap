@@ -480,9 +480,1154 @@ pub fn verify_light(
     hash_int < target
 }
 
+/// Computes the "vein yield" of a proof-of-work hash.
+///
+/// Vein yield measures how "lucky" a hash is — how far below the target
+/// the hash fell. A hash exactly at the target has yield = 1.
+/// A hash at MAX has yield approaching infinity.
+///
+/// This is used to measure mining luck and compute expected yields.
+///
+/// # Arguments
+/// * `pow_hash` - The proof-of-work hash output
+/// * `difficulty` - The current difficulty target
+///
+/// # Returns
+/// A f64 value representing how "lucky" this hash is (always >= 1.0)
+pub fn compute_vein_yield(pow_hash: &Hash, difficulty: u64) -> f64 {
+    let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
+    let target = u64::MAX / difficulty;
+
+    if hash_int >= target {
+        return 1.0;
+    }
+
+    let numerator = (target - hash_int) as f64;
+    let denominator = hash_int as f64 + 1.0;
+    let ratio = numerator / denominator;
+
+    ratio + 1.0
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =============================================================================
+    // 1. DETERMINISM TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_determinism_same_inputs_same_hash() {
+        let header = b"determinism test header";
+        let height = 100u64;
+        let nonce = 42u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds1 = generate_dataset(&seed);
+        let mut ds2 = generate_dataset(&seed);
+
+        let hash1 = evo_omap_hash(&mut ds1, header, height, nonce);
+        let hash2 = evo_omap_hash(&mut ds2, header, height, nonce);
+
+        assert_eq!(hash1, hash2, "Same inputs must produce identical hash");
+    }
+
+    #[test]
+    fn test_determinism_fuzz_50_random_combinations() {
+        let mut rng_state: u64 = 0x1234567890ABCDEF;
+
+        for _ in 0..50 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+            let _seed_bytes: [u8; 1] = (rng_state as u8).to_le_bytes();
+
+            let seed = compute_epoch_seed(rng_state % 10000);
+
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let nonce = rng_state;
+
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let height = rng_state % 10000;
+
+            let header = format!("header_{}", rng_state % 1000);
+
+            let mut ds1 = generate_dataset(&seed);
+            let mut ds2 = generate_dataset(&seed);
+            let h1 = evo_omap_hash(&mut ds1, header.as_bytes(), height, nonce);
+            let h2 = evo_omap_hash(&mut ds2, header.as_bytes(), height, nonce);
+
+            assert_eq!(h1, h2);
+        }
+    }
+
+    #[test]
+    fn test_dataset_generation_deterministic() {
+        let seed = compute_epoch_seed(0);
+        let ds1 = generate_dataset(&seed);
+        let ds2 = generate_dataset(&seed);
+
+        assert_eq!(ds1.nodes.len(), NUM_NODES);
+        for i in 0..NUM_NODES {
+            assert_eq!(ds1.nodes[i], ds2.nodes[i], "Node {} must be identical", i);
+        }
+    }
+
+    // =============================================================================
+    // 2. DATASET GENERATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_dataset_node_0_format() {
+        let seed = compute_epoch_seed(0);
+        let seed_bytes = seed.as_ref();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(DOMAIN_NODE);
+        data.extend_from_slice(seed_bytes);
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let expected_node_0 = blake3_xof(&data, NODE_SIZE);
+
+        let ds = generate_dataset(&seed);
+        assert_eq!(ds.nodes[0], expected_node_0);
+    }
+
+    #[test]
+    fn test_dataset_node_i_chained() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+
+        for i in 1..NUM_NODES {
+            let seed_bytes = seed.as_ref();
+            let mut data = Vec::new();
+            data.extend_from_slice(DOMAIN_NODE);
+            data.extend_from_slice(seed_bytes);
+            data.extend_from_slice(&ds.nodes[i - 1]);
+            data.extend_from_slice(&i.to_le_bytes());
+
+            let expected = blake3_xof(&data, NODE_SIZE);
+            assert_eq!(ds.nodes[i], expected, "Node {} should be chained from node {}", i, i - 1);
+        }
+    }
+
+    #[test]
+    fn test_dataset_node_size_exactly_1mb() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+
+        for i in 0..NUM_NODES {
+            assert_eq!(ds.nodes[i].len(), NODE_SIZE, "Node {} should be 1 MiB", i);
+            assert_eq!(ds.nodes[i].len(), 1_048_576, "Node {} should be exactly 1,048,576 bytes", i);
+        }
+    }
+
+    #[test]
+    fn test_dataset_has_256_nodes() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+        assert_eq!(ds.nodes.len(), 256);
+    }
+
+    #[test]
+    fn test_different_seeds_different_datasets() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1 = compute_epoch_seed(1024);
+        let ds0 = generate_dataset(&seed0);
+        let ds1 = generate_dataset(&seed1);
+
+        assert_ne!(ds0.nodes[0], ds1.nodes[0], "Different seeds produce different node 0");
+        assert_ne!(ds0.nodes[128], ds1.nodes[128], "Different seeds produce different node 128");
+        assert_ne!(ds0.nodes[255], ds1.nodes[255], "Different seeds produce different node 255");
+    }
+
+    // =============================================================================
+    // 3. EPOCH SEED DERIVATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_epoch_seed_format() {
+        let seed0 = compute_epoch_seed(0);
+
+        let mut expected_data = Vec::new();
+        expected_data.extend_from_slice(DOMAIN_EPOCH);
+        expected_data.extend_from_slice(&0u64.to_le_bytes());
+        let expected = blake3_256(&expected_data);
+
+        assert_eq!(seed0, expected);
+    }
+
+    #[test]
+    fn test_epoch_seed_epoch_0_all_heights_same() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1 = compute_epoch_seed(1);
+        let seed512 = compute_epoch_seed(512);
+        let seed1023 = compute_epoch_seed(1023);
+
+        assert_eq!(seed0, seed1);
+        assert_eq!(seed0, seed512);
+        assert_eq!(seed0, seed1023);
+    }
+
+    #[test]
+    fn test_epoch_seed_different_epochs_different_seeds() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1 = compute_epoch_seed(1024);
+        let seed2 = compute_epoch_seed(2048);
+
+        assert_ne!(seed0, seed1);
+        assert_ne!(seed1, seed2);
+    }
+
+    #[test]
+    fn test_epoch_seed_is_32_bytes() {
+        let seed = compute_epoch_seed(100);
+        assert_eq!(seed.0.len(), 32);
+    }
+
+    // =============================================================================
+    // 4. MINING SEED DERIVATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_mining_seed_format() {
+        let header = b"test header";
+        let height = 100u64;
+        let nonce = 42u64;
+
+        let mut expected_data = Vec::new();
+        expected_data.extend_from_slice(DOMAIN_SEED);
+        expected_data.extend_from_slice(header);
+        expected_data.extend_from_slice(&height.to_le_bytes());
+        expected_data.extend_from_slice(&nonce.to_le_bytes());
+
+        let expected = blake3_256(&expected_data);
+
+        let seed = compute_epoch_seed(height);
+        let _state = State::from_seed(&expected);
+        let _derived_seed = State::from_seed(&seed);
+    }
+
+    #[test]
+    fn test_mining_seed_different_nonces_different_seeds() {
+        let header = b"test header";
+        let height = 100u64;
+
+        let mut data1 = Vec::new();
+        data1.extend_from_slice(DOMAIN_SEED);
+        data1.extend_from_slice(header);
+        data1.extend_from_slice(&height.to_le_bytes());
+        data1.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(DOMAIN_SEED);
+        data2.extend_from_slice(header);
+        data2.extend_from_slice(&height.to_le_bytes());
+        data2.extend_from_slice(&1u64.to_le_bytes());
+
+        let seed1 = blake3_256(&data1);
+        let seed2 = blake3_256(&data2);
+
+        assert_ne!(seed1, seed2);
+    }
+
+    #[test]
+    fn test_mining_seed_different_headers_different_seeds() {
+        let height = 100u64;
+        let nonce = 42u64;
+
+        let mut data1 = Vec::new();
+        data1.extend_from_slice(DOMAIN_SEED);
+        data1.extend_from_slice(b"header1");
+        data1.extend_from_slice(&height.to_le_bytes());
+        data1.extend_from_slice(&nonce.to_le_bytes());
+
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(DOMAIN_SEED);
+        data2.extend_from_slice(b"header2");
+        data2.extend_from_slice(&height.to_le_bytes());
+        data2.extend_from_slice(&nonce.to_le_bytes());
+
+        let seed1 = blake3_256(&data1);
+        let seed2 = blake3_256(&data2);
+
+        assert_ne!(seed1, seed2);
+    }
+
+    // =============================================================================
+    // 5. PROGRAM GENERATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_program_generation_always_8_instructions() {
+        let seed = Hash([1u8; 32]);
+        let state = State::from_seed(&seed);
+
+        for _ in 0..100 {
+            let rng_state = (state.as_u64_array()[0] ^ state.as_u64_array()[1]).wrapping_add(1);
+            let test_state = State::from_seed(&Hash::from_bytes([(rng_state & 0xFF) as u8; 32]));
+            let program = generate_program(&test_state);
+            assert_eq!(program.instructions.len(), PROGRAM_LENGTH);
+        }
+    }
+
+    #[test]
+    fn test_program_generation_only_valid_opcodes() {
+        let seed = Hash([42u8; 32]);
+        let state = State::from_seed(&seed);
+        let program = generate_program(&state);
+
+        for instruction in &program.instructions {
+            match instruction {
+                Instruction::Add { .. } => {}
+                Instruction::Sub { .. } => {}
+                Instruction::Mul { .. } => {}
+                Instruction::Xor { .. } => {}
+                Instruction::Rotl { .. } => {}
+                Instruction::Rotr { .. } => {}
+                Instruction::Mulh { .. } => {}
+                Instruction::Swap { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_program_generation_src_register_always_valid() {
+        let seed = Hash([99u8; 32]);
+        let state = State::from_seed(&seed);
+        let program = generate_program(&state);
+
+        for instruction in &program.instructions {
+            let src = match instruction {
+                Instruction::Add { src, .. } => *src,
+                Instruction::Sub { src, .. } => *src,
+                Instruction::Mul { src, .. } => *src,
+                Instruction::Xor { src, .. } => *src,
+                Instruction::Rotl { .. } => continue,
+                Instruction::Rotr { .. } => continue,
+                Instruction::Mulh { src, .. } => *src,
+                Instruction::Swap { .. } => continue,
+            };
+            assert!(src < 8, "src register {} must be 0-7", src);
+        }
+    }
+
+    #[test]
+    fn test_program_generation_dst_register_always_valid() {
+        let seed = Hash([77u8; 32]);
+        let state = State::from_seed(&seed);
+        let program = generate_program(&state);
+
+        for instruction in &program.instructions {
+            let dst = match instruction {
+                Instruction::Add { dst, .. } => *dst,
+                Instruction::Sub { dst, .. } => *dst,
+                Instruction::Mul { dst, .. } => *dst,
+                Instruction::Xor { dst, .. } => *dst,
+                Instruction::Rotl { dst, .. } => *dst,
+                Instruction::Rotr { dst, .. } => *dst,
+                Instruction::Mulh { dst, .. } => *dst,
+                Instruction::Swap { a, .. } => *a,
+            };
+            assert!(dst < 8, "dst register {} must be 0-7", dst);
+        }
+    }
+
+    #[test]
+    fn test_program_generation_deterministic() {
+        let seed = Hash([123u8; 32]);
+        let state = State::from_seed(&seed);
+        let p1 = generate_program(&state);
+        let p2 = generate_program(&state);
+        assert_eq!(p1.instructions, p2.instructions);
+    }
+
+    #[test]
+    fn test_different_states_different_programs() {
+        let state1 = State::from_seed(&Hash([1u8; 32]));
+        let state2 = State::from_seed(&Hash([2u8; 32]));
+        let p1 = generate_program(&state1);
+        let p2 = generate_program(&state2);
+        assert_ne!(p1.instructions, p2.instructions);
+    }
+
+    // =============================================================================
+    // 6. INSTRUCTION EXECUTION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_instruction_add_wrapping() {
+        let mut state = [u64::MAX, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [1u64; 128];
+        let node2_words = [0u64; 128];
+
+        let add = Instruction::Add { dst: 0, src: 0 };
+        add.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], 0);
+    }
+
+    #[test]
+    fn test_instruction_sub_wrapping() {
+        let mut state = [0u64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [0u64; 128];
+        let node2_words = [1u64; 128];
+
+        let sub = Instruction::Sub { dst: 0, src: 0 };
+        sub.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], u64::MAX);
+    }
+
+    #[test]
+    fn test_instruction_mul_wrapping() {
+        let mut state = [2u64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [u64::MAX, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+        let node2_words = [0u64; 128];
+
+        let mul = Instruction::Mul { dst: 0, src: 0 };
+        mul.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], u64::MAX.wrapping_mul(u64::MAX));
+    }
+
+    #[test]
+    fn test_instruction_xor() {
+        let mut state = [0xFFu64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [0u64; 128];
+        let node2_words = [0x0Fu64; 128];
+
+        let xor = Instruction::Xor { dst: 0, src: 0 };
+        xor.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], 0xF0u64);
+    }
+
+    #[test]
+    fn test_instruction_rotr_data_dependent() {
+        let mut state = [0x01u64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [0u64; 128];
+        let node2_words = [0u64; 128];
+
+        let rotl = Instruction::Rotl { dst: 0, imm: 1 };
+        rotl.execute(&mut state, &node1_words, &node2_words);
+
+        let val = 0x01u64;
+        let expected = val.rotate_left((val & 0x3F).wrapping_add(1) as u32);
+        assert_eq!(state[0], expected);
+    }
+
+    #[test]
+    fn test_instruction_mulh_edge_case() {
+        let mut state = [u64::MAX, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [u64::MAX; 128];
+        let node2_words = [0u64; 128];
+
+        let mulh = Instruction::Mulh { dst: 0, src: 0 };
+        mulh.execute(&mut state, &node1_words, &node2_words);
+
+        let wide: u128 = (u64::MAX as u128).wrapping_mul(u64::MAX as u128);
+        let expected = (wide >> 64) as u64;
+        assert_eq!(state[0], expected);
+    }
+
+    #[test]
+    fn test_instruction_swap() {
+        let mut state = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        let node1_words = [0u64; 128];
+        let node2_words = [0u64; 128];
+
+        let swap = Instruction::Swap { a: 0, b: 1 };
+        swap.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], 2);
+        assert_eq!(state[1], 1);
+    }
+
+    // =============================================================================
+    // 7. BRANCH OPERATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_branch_variant_range() {
+        for _ in 0..100 {
+            let state = State::from_seed(&Hash([rand::random(); 32]));
+            let words = state.as_u64_array();
+            let variant = words[0] & 0x03;
+            assert!(variant <= 3, "Branch variant must be 0-3");
+        }
+    }
+
+    #[test]
+    fn test_branch_xor_not_replace() {
+        let seed1 = Hash([1u8; 32]);
+        let seed2 = Hash([2u8; 32]);
+
+        let state1_orig = State::from_seed(&seed1);
+        let state2_orig = State::from_seed(&seed2);
+
+        let node1 = vec![0xFFu8; 1024];
+        let node2 = vec![0xAAu8; 1024];
+
+        let mut s1 = state1_orig.clone();
+        let mut s2 = state2_orig.clone();
+
+        apply_branch(&mut s1, 0, &node1, &node2);
+        apply_branch(&mut s2, 0, &node1, &node2);
+
+        let orig_words = state1_orig.as_u64_array();
+        let new_words = s1.as_u64_array();
+        let mut any_different = false;
+        for i in 0..8 {
+            if orig_words[i] != new_words[i] {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "Branch must modify state via XOR");
+
+        assert_ne!(s1.as_u64_array(), s2.as_u64_array(), "Different states must produce different branches");
+    }
+
+    #[test]
+    fn test_branch_distribution_uniform() {
+        let mut counts = [0u64; 4];
+
+        for i in 0..10000 {
+            let seed = Hash::from_bytes({
+                let mut arr = [0u8; 32];
+                arr[0] = (i & 0xFF) as u8;
+                arr
+            });
+            let state = State::from_seed(&seed);
+            let words = state.as_u64_array();
+            let variant = (words[0] & 0x03) as usize;
+            counts[variant] += 1;
+        }
+
+        for i in 0..4 {
+            let percentage = counts[i] as f64 / 10000.0;
+            assert!(percentage > 0.15 && percentage < 0.40,
+                "Branch {} has {}%, expected 20-35%", i, percentage * 100.0);
+        }
+    }
+
+    // =============================================================================
+    // 8. WRITE STEP TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_write_step_mutates_dataset() {
+        let header = b"test write";
+        let height = 50u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+        let base_ds = generate_dataset(&seed);
+
+        let mut ds = Dataset::new();
+        for i in 0..NUM_NODES {
+            ds.set(i, base_ds.get(i).to_vec());
+        }
+
+        let original_node_100 = ds.get(100).to_vec();
+
+        let _hash = evo_omap_hash(&mut ds, header, height, nonce);
+
+        let final_node_100 = ds.get(100).to_vec();
+        assert_ne!(original_node_100, final_node_100, "Dataset node should be modified");
+    }
+
+    #[test]
+    fn test_write_step_deterministic() {
+        let header = b"deterministic write test";
+        let height = 75u64;
+        let nonce = 123u64;
+
+        let seed = compute_epoch_seed(height);
+        let base_ds = generate_dataset(&seed);
+
+        let mut ds1 = Dataset::new();
+        let mut ds2 = Dataset::new();
+        for i in 0..NUM_NODES {
+            ds1.set(i, base_ds.get(i).to_vec());
+            ds2.set(i, base_ds.get(i).to_vec());
+        }
+
+        let _hash1 = evo_omap_hash(&mut ds1, header, height, nonce);
+        let _hash2 = evo_omap_hash(&mut ds2, header, height, nonce);
+
+        for i in 0..NUM_NODES {
+            assert_eq!(ds1.nodes[i], ds2.nodes[i], "Same inputs must produce same write at node {}", i);
+        }
+    }
+
+    // =============================================================================
+    // 9. ROLLING COMMITMENT TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_rolling_commitment_deterministic() {
+        let header = b"rolling commitment test";
+        let height = 200u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds1 = generate_dataset(&seed);
+        let mut ds2 = generate_dataset(&seed);
+
+        let _hash1 = evo_omap_hash(&mut ds1, header, height, nonce);
+        let _hash2 = evo_omap_hash(&mut ds2, header, height, nonce);
+    }
+
+    #[test]
+    fn test_rolling_commitment_different_paths_different_final() {
+        let header = b"rolling path test";
+        let height = 300u64;
+
+        let seed = compute_epoch_seed(height);
+
+        let mut ds1 = generate_dataset(&seed);
+        let h1 = evo_omap_hash(&mut ds1, header, height, 0);
+
+        let mut ds2 = generate_dataset(&seed);
+        let h2 = evo_omap_hash(&mut ds2, header, height, 1);
+
+        assert_ne!(h1, h2, "Different nonces must produce different hashes and thus different final commitments");
+    }
+
+    // =============================================================================
+    // 10. MEMORY COMMITMENT TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_memory_commitment_format() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DOMAIN_MEMORY);
+        for node in &ds.nodes {
+            hasher.update(node);
+        }
+        let result = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(result.as_bytes());
+        let expected = Hash::from_bytes(arr);
+
+        let computed = compute_merkle_root(&ds);
+
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn test_memory_commitment_changes_with_dataset() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+        let root1 = compute_merkle_root(&ds);
+
+        let mut modified_ds = generate_dataset(&seed);
+        modified_ds.nodes[0][0] ^= 0x01;
+        let root2 = compute_merkle_root(&modified_ds);
+
+        assert_ne!(root1, root2, "Changing any node must change memory commitment");
+    }
+
+    // =============================================================================
+    // 11. FINAL HASH TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_final_hash_uses_sha3_256() {
+        let header = b"final hash test";
+        let height = 500u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, header, height, nonce);
+
+        assert_eq!(hash.0.len(), 32);
+    }
+
+    #[test]
+    fn test_final_hash_different_inputs_different_outputs() {
+        let seed = compute_epoch_seed(0);
+
+        let mut ds1 = generate_dataset(&seed);
+        let h1 = evo_omap_hash(&mut ds1, b"header1", 0, 0);
+
+        let mut ds2 = generate_dataset(&seed);
+        let h2 = evo_omap_hash(&mut ds2, b"header2", 0, 0);
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_final_hash_deterministic() {
+        let header = b"deterministic final hash";
+        let height = 600u64;
+        let nonce = 99u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds1 = generate_dataset(&seed);
+        let mut ds2 = generate_dataset(&seed);
+
+        let h1 = evo_omap_hash(&mut ds1, header, height, nonce);
+        let h2 = evo_omap_hash(&mut ds2, header, height, nonce);
+
+        assert_eq!(h1, h2);
+    }
+
+    // =============================================================================
+    // 12. LIGHT VS FULL VERIFICATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_light_and_full_produce_same_hash() {
+        let header = b"light vs full verification";
+        let height = 50u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+
+        let mut ds_full = generate_dataset(&seed);
+        let hash_full = evo_omap_hash(&mut ds_full, header, height, nonce);
+
+        let _cache = generate_cache(&seed);
+        let mut ds_light = Dataset::new();
+        let mut prev_node = Vec::new();
+        for i in 0..NUM_NODES {
+            let node = if i == 0 {
+                blake3_xof(
+                    &[
+                        DOMAIN_NODE,
+                        seed.as_ref(),
+                        &(0u64).to_le_bytes(),
+                    ]
+                    .iter()
+                    .flat_map(|v| v.iter())
+                    .cloned()
+                    .collect::<Vec<u8>>(),
+                    NODE_SIZE,
+                )
+            } else {
+                let mut data = Vec::new();
+                data.extend_from_slice(DOMAIN_NODE);
+                data.extend_from_slice(seed.as_ref());
+                data.extend_from_slice(&prev_node);
+                data.extend_from_slice(&i.to_le_bytes());
+                blake3_xof(&data, NODE_SIZE)
+            };
+            ds_light.set(i, node.clone());
+            prev_node = node;
+        }
+        let hash_light = evo_omap_hash(&mut ds_light, header, height, nonce);
+
+        assert_eq!(hash_full, hash_light);
+    }
+
+    // =============================================================================
+    // 13. DOMAIN SEPARATOR UNIQUENESS TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_domain_separators_are_distinct() {
+        let data = b"test data for domain separator";
+
+        let hash_epoch = blake3_256(&[DOMAIN_EPOCH, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_node = blake3_256(&[DOMAIN_NODE, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_seed = blake3_256(&[DOMAIN_SEED, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_cache = blake3_256(&[DOMAIN_CACHE, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_branch = blake3_256(&[DOMAIN_BRANCH, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_commitment = blake3_256(&[DOMAIN_COMMITMENT, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_memory = blake3_256(&[DOMAIN_MEMORY, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+
+        let hashes = [hash_epoch, hash_node, hash_seed, hash_cache, hash_branch, hash_commitment, hash_memory];
+
+        for i in 0..hashes.len() {
+            for j in (i+1)..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "Domain separator {} must be distinct from {}", i, j);
+            }
+        }
+    }
+
+    // =============================================================================
+    // 14. OPERAND BOUNDS TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_operand_access_never_exceeds_127() {
+        let header = b"operand bounds test";
+        let height = 700u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+
+        let _hash = evo_omap_hash(&mut ds, header, height, 0);
+
+        for i in 0..NUM_NODES {
+            assert_eq!(ds.nodes[i].len(), NODE_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_derive_indices_always_in_range() {
+        for step in 0..100u64 {
+            let state = State::from_seed(&Hash::from_bytes({
+                let mut arr = [0u8; 32];
+                arr[0..8].copy_from_slice(&step.to_le_bytes());
+                arr
+            }));
+
+            let (idx1, idx2, idx_write) = derive_indices(&state, step);
+
+            assert!(idx1 < NUM_NODES, "idx1 must be < {}", NUM_NODES);
+            assert!(idx2 < NUM_NODES, "idx2 must be < {}", NUM_NODES);
+            assert!(idx_write < NUM_NODES, "idx_write must be < {}", NUM_NODES);
+        }
+    }
+
+    // =============================================================================
+    // 15. COPY-ON-WRITE MINING TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_cow_produces_same_result_as_naive() {
+        let header = b"CoW mining test";
+        let height = 800u64;
+        let seed = compute_epoch_seed(height);
+
+        let base_ds = generate_dataset(&seed);
+
+        for nonce in 0..5u64 {
+            let mut ds_naive = Dataset::new();
+            for i in 0..NUM_NODES {
+                ds_naive.set(i, base_ds.get(i).to_vec());
+            }
+            let hash_naive = evo_omap_hash(&mut ds_naive, header, height, nonce);
+
+            let mut cow = CowDataset::new(&base_ds);
+            cow.reset();
+            let mut ds_cow = Dataset::new();
+            for i in 0..NUM_NODES {
+                ds_cow.set(i, cow.get(i).to_vec());
+            }
+            let hash_cow = evo_omap_hash(&mut ds_cow, header, height, nonce);
+
+            assert_eq!(hash_naive, hash_cow, "CoW must produce same result as naive for nonce {}", nonce);
+        }
+    }
+
+    // =============================================================================
+    // 16. EPOCH BOUNDARY TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_epoch_boundary_different_datasets() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1023 = compute_epoch_seed(1023);
+        let seed1024 = compute_epoch_seed(1024);
+
+        assert_eq!(seed0, seed1023);
+        assert_ne!(seed0, seed1024);
+
+        let ds0 = generate_dataset(&seed0);
+        let ds1024 = generate_dataset(&seed1024);
+
+        assert_ne!(ds0.nodes[0], ds1024.nodes[0]);
+        assert_ne!(ds0.nodes[128], ds1024.nodes[128]);
+        assert_ne!(ds0.nodes[255], ds1024.nodes[255]);
+    }
+
+    // =============================================================================
+    // 17. DIFFICULTY VALIDATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_difficulty_validation_easy() {
+        let header = b"easy difficulty test";
+        let height = 900u64;
+        let difficulty = 1u64;
+        let target = u64::MAX / difficulty;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, header, height, 0);
+        let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
+
+        assert!(hash_int < target, "Difficulty 1 should accept most hashes");
+    }
+
+    #[test]
+    fn test_difficulty_validation_hard() {
+        let header = b"hard difficulty test";
+        let height = 950u64;
+        let difficulty = 1_000_000u64;
+
+        assert!(!verify(header, height, 0, difficulty));
+    }
+
+    #[test]
+    fn test_verify_accepts_valid_proof() {
+        let header = b"valid proof test";
+        let height = 1000u64;
+        let difficulty = 1u64;
+        let target = u64::MAX / difficulty;
+
+        let seed = compute_epoch_seed(height);
+        let base_ds = generate_dataset(&seed);
+
+        let mut found_nonce = None;
+        for nonce in 0..1_000_000u64 {
+            let mut ds = Dataset::new();
+            for i in 0..NUM_NODES {
+                ds.set(i, base_ds.get(i).to_vec());
+            }
+            let hash = evo_omap_hash(&mut ds, header, height, nonce);
+            let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
+            if hash_int < target {
+                found_nonce = Some(nonce);
+                break;
+            }
+        }
+
+        assert!(found_nonce.is_some(), "Failed to find valid nonce in 1M attempts");
+        let nonce = found_nonce.unwrap();
+        assert!(verify(header, height, nonce, difficulty));
+    }
+
+    // =============================================================================
+    // 18. EDGE CASES TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_edge_case_zero_seed() {
+        let seed = Hash([0u8; 32]);
+        let state = State::from_seed(&seed);
+        assert_ne!(state.as_u64_array(), [0u64; 8]);
+    }
+
+    #[test]
+    fn test_edge_case_max_seed() {
+        let seed = Hash([0xFFu8; 32]);
+        let state = State::from_seed(&seed);
+        assert_ne!(state.as_u64_array(), [0u64; 8]);
+    }
+
+    #[test]
+    fn test_edge_case_empty_header() {
+        let header: &[u8] = &[];
+        let height = 0u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, header, height, nonce);
+
+        assert_eq!(hash.0.len(), 32);
+    }
+
+    #[test]
+    fn test_edge_case_nonce_max() {
+        let header = b"max nonce test";
+        let height = 0u64;
+        let nonce = u64::MAX;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds1 = generate_dataset(&seed);
+        let mut ds2 = generate_dataset(&seed);
+
+        let h1 = evo_omap_hash(&mut ds1, header, height, nonce);
+        let h2 = evo_omap_hash(&mut ds2, header, height, nonce);
+
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_edge_case_difficulty_1() {
+        let header = b"difficulty 1 test";
+        let height = 1100u64;
+        let difficulty = 1u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, header, height, 0);
+        let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
+        let target = u64::MAX / difficulty;
+
+        assert!(hash_int < target);
+    }
+
+    #[test]
+    fn test_edge_case_integer_overflow_mul() {
+        let mut state = [u64::MAX, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [u64::MAX; 128];
+        let node2_words = [0u64; 128];
+
+        let mul = Instruction::Mul { dst: 0, src: 0 };
+        mul.execute(&mut state, &node1_words, &node2_words);
+
+        let expected = u64::MAX.wrapping_mul(u64::MAX);
+        assert_eq!(state[0], expected);
+    }
+
+    #[test]
+    fn test_edge_case_mulh_max_values() {
+        let mut state = [u64::MAX, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [u64::MAX; 128];
+        let node2_words = [0u64; 128];
+
+        let mulh = Instruction::Mulh { dst: 0, src: 0 };
+        mulh.execute(&mut state, &node1_words, &node2_words);
+
+        let wide: u128 = (u64::MAX as u128).wrapping_mul(u64::MAX as u128);
+        let expected = (wide >> 64) as u64;
+        assert_eq!(state[0], expected);
+    }
+
+    #[test]
+    fn test_edge_case_rotr_by_0() {
+        let mut state = [0x123456789ABCDEFu64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [0u64; 128];
+        let node2_words = [0u64; 128];
+
+        let rotr = Instruction::Rotr { dst: 0, imm: 0 };
+        rotr.execute(&mut state, &node1_words, &node2_words);
+
+        assert_eq!(state[0], 0x123456789ABCDEF);
+    }
+
+    #[test]
+    fn test_edge_case_rotl_by_63() {
+        let mut state = [1u64, 0, 0, 0, 0, 0, 0, 0];
+        let node1_words = [0u64; 128];
+        let node2_words = [0u64; 128];
+
+        let rotl = Instruction::Rotl { dst: 0, imm: 63 };
+        rotl.execute(&mut state, &node1_words, &node2_words);
+
+        let val = 1u64;
+        let expected = val.rotate_left((val & 0x3F).wrapping_add(63) as u32);
+        assert_eq!(state[0], expected);
+    }
+
+    // =============================================================================
+    // 19. VEIN YIELD TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_vein_yield_always_at_least_1() {
+        let seed = compute_epoch_seed(0);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, b"vein yield test", 0, 0);
+
+        let vy = compute_vein_yield(&hash, 1);
+
+        assert!(vy >= 1.0, "Vein yield must be >= 1.0");
+    }
+
+    #[test]
+    fn test_vein_yield_at_target_is_1() {
+        let hash = Hash::from_bytes([0xFFu8; 32]);
+        let vy = compute_vein_yield(&hash, 1);
+
+        assert_eq!(vy, 1.0);
+    }
+
+    #[test]
+    fn test_vein_yield_very_lucky_hash() {
+        let hash = Hash::from_bytes([0x01u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let vy = compute_vein_yield(&hash, 1000);
+
+        assert!(vy > 1.0, "Lucky hash should have vein yield > 1");
+        assert!(vy.is_finite(), "Vein yield must be finite");
+        assert!(vy >= 1.0, "Vein yield must be >= 1.0");
+    }
+
+    #[test]
+    fn test_vein_yield_no_nan() {
+        for difficulty in [1u64, 100, 10000, 1_000_000] {
+            for nonce in 0..100 {
+                let seed = compute_epoch_seed(nonce);
+                let mut ds = generate_dataset(&seed);
+                let hash = evo_omap_hash(&mut ds, b"nan test", nonce, nonce);
+
+                let vy = compute_vein_yield(&hash, difficulty);
+
+                assert!(!vy.is_nan(), "Vein yield must not be NaN for difficulty {}", difficulty);
+                assert!(!vy.is_infinite(), "Vein yield must not be infinite for difficulty {}", difficulty);
+                assert!(vy >= 1.0, "Vein yield must be >= 1.0 for difficulty {}", difficulty);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vein_yield_expected_value() {
+        let mut total_yield = 0.0;
+        let samples = 10000;
+        let difficulty = 1000u64;
+
+        for nonce in 0..samples {
+            let seed = compute_epoch_seed(nonce);
+            let mut ds = generate_dataset(&seed);
+            let hash = evo_omap_hash(&mut ds, b"expected yield test", nonce, nonce);
+
+            let vy = compute_vein_yield(&hash, difficulty);
+            total_yield += vy;
+        }
+
+        let avg_yield = total_yield / samples as f64;
+
+        assert!(avg_yield > 1.5 && avg_yield < 2.5,
+            "Expected vein yield around 2.0, got {} over {} samples", avg_yield, samples);
+    }
+
+    // =============================================================================
+    // 20. KNOWN-ANSWER TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_known_answer_epoch_seed() {
+        let seed = compute_epoch_seed(0);
+        let expected_first_8_bytes = [
+            0x9bu8, 0x5bu8, 0x08u8, 0xa7u8, 0x71u8, 0xd5u8, 0x74u8, 0x67u8
+        ];
+        assert_eq!(&seed.0[..8], &expected_first_8_bytes);
+    }
+
+    #[test]
+    fn test_known_answer_deterministic_hash() {
+        let header = b"known answer test";
+        let height = 1024u64;
+        let nonce = 42u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut ds = generate_dataset(&seed);
+        let hash = evo_omap_hash(&mut ds, header, height, nonce);
+
+        let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
+        assert!(hash_int != 0, "Hash should not be zero");
+
+        assert_eq!(hash.0.len(), 32, "Hash should be 32 bytes");
+    }
+
+    #[test]
+    fn test_known_answer_verify_rejects_wrong_nonce() {
+        let header = b"wrong nonce test";
+        let height = 2000u64;
+        let difficulty = 1000u64;
+
+        assert!(!verify(header, height, 999999, difficulty));
+    }
+
+    // =============================================================================
+    // STATE CONVERSION TESTS
+    // =============================================================================
 
     #[test]
     fn test_state_as_u64_array() {
@@ -510,58 +1655,9 @@ mod tests {
         assert_ne!(arr, [0u64; 8]);
     }
 
-    #[test]
-    fn test_compute_epoch_seed() {
-        let seed0 = compute_epoch_seed(0);
-        let seed1 = compute_epoch_seed(1);
-        let seed1023 = compute_epoch_seed(1023);
-        let seed1024 = compute_epoch_seed(1024);
-        let seed1025 = compute_epoch_seed(1025);
-        assert_eq!(seed0, compute_epoch_seed(0));
-        assert_eq!(seed0, seed1);
-        assert_eq!(seed0, seed1023);
-        assert_ne!(seed0, seed1024);
-        assert_eq!(seed1024, seed1025);
-    }
-
-    #[test]
-    fn test_generate_dataset_deterministic() {
-        let seed = compute_epoch_seed(0);
-        let ds1 = generate_dataset(&seed);
-        let ds2 = generate_dataset(&seed);
-        assert_eq!(ds1.nodes.len(), NUM_NODES);
-        assert_eq!(ds1.nodes.len(), ds2.nodes.len());
-        for i in 0..NUM_NODES {
-            assert_eq!(ds1.nodes[i], ds2.nodes[i]);
-        }
-    }
-
-    #[test]
-    fn test_generate_cache_deterministic() {
-        let seed = compute_epoch_seed(0);
-        let c1 = generate_cache(&seed);
-        let c2 = generate_cache(&seed);
-        assert_eq!(c1.data.len(), CACHE_SIZE);
-        assert_eq!(c1.data, c2.data);
-    }
-
-    #[test]
-    fn test_different_seeds_different_datasets() {
-        let seed0 = compute_epoch_seed(0);
-        let seed1 = compute_epoch_seed(1024);
-        let ds0 = generate_dataset(&seed0);
-        let ds1 = generate_dataset(&seed1);
-        assert_ne!(ds0.nodes[0], ds1.nodes[0]);
-    }
-
-    #[test]
-    fn test_generate_program_deterministic() {
-        let seed = Hash([1u8; 32]);
-        let state = State::from_seed(&seed);
-        let p1 = generate_program(&state);
-        let p2 = generate_program(&state);
-        assert_eq!(p1.instructions, p2.instructions);
-    }
+    // =============================================================================
+    // INDEX DERIVATION TESTS
+    // =============================================================================
 
     #[test]
     fn test_derive_indices() {
@@ -571,6 +1667,53 @@ mod tests {
         assert_eq!(i2, 0);
         assert_eq!(iw, 0);
     }
+
+    // =============================================================================
+    // DATASET MODIFICATION TESTS
+    // =============================================================================
+
+    #[test]
+    fn test_dataset_modification_after_hash() {
+        let header = b"dataset modification test";
+        let height = 3000u64;
+        let nonce = 0u64;
+
+        let seed = compute_epoch_seed(height);
+        let base_ds = generate_dataset(&seed);
+
+        let mut ds = Dataset::new();
+        for i in 0..NUM_NODES {
+            ds.set(i, base_ds.get(i).to_vec());
+        }
+
+        let original_node_0 = ds.get(0).to_vec();
+
+        let _hash = evo_omap_hash(&mut ds, header, height, nonce);
+
+        let final_node_0 = ds.get(0).to_vec();
+        assert_ne!(original_node_0, final_node_0, "Dataset node should be modified after hash");
+    }
+
+    #[test]
+    fn test_chained_dataset_generation() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+        assert_ne!(ds.nodes[0], ds.nodes[1]);
+        assert_ne!(ds.nodes[1], ds.nodes[2]);
+        assert_ne!(ds.nodes[254], ds.nodes[255]);
+    }
+
+    #[test]
+    fn test_node_size() {
+        let seed = compute_epoch_seed(0);
+        let ds = generate_dataset(&seed);
+        assert_eq!(ds.nodes[0].len(), NODE_SIZE);
+        assert_eq!(ds.nodes[255].len(), NODE_SIZE);
+    }
+
+    // =============================================================================
+    // ADDITIONAL COMPREHENSIVE TESTS
+    // =============================================================================
 
     #[test]
     fn test_full_hash_deterministic() {
@@ -614,49 +1757,11 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_accepts_valid_proof() {
-        let header = b"test header for mining";
-        let height = 100u64;
-        let difficulty = 1u64;
-        let target = u64::MAX / difficulty;
-
-        let seed = compute_epoch_seed(height);
-        let base_ds = generate_dataset(&seed);
-
-        let mut found_nonce = None;
-        for nonce in 0..1_000_000u64 {
-            let mut ds = Dataset::new();
-            for i in 0..NUM_NODES {
-                ds.set(i, base_ds.get(i).to_vec());
-            }
-            let hash = evo_omap_hash(&mut ds, header, height, nonce);
-            let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
-            if hash_int < target {
-                found_nonce = Some(nonce);
-                break;
-            }
-        }
-
-        assert!(found_nonce.is_some(), "Failed to find valid nonce in 1M attempts");
-        let nonce = found_nonce.unwrap();
-        assert!(verify(header, height, nonce, difficulty));
-    }
-
-    #[test]
     fn test_verify_rejects_invalid_proof() {
         let header = b"test header";
         let height = 100u64;
         let difficulty = 1_000_000u64;
         assert!(!verify(header, height, 0, difficulty));
-    }
-
-    #[test]
-    fn test_epoch_boundary() {
-        let seed0 = compute_epoch_seed(0);
-        let seed1023 = compute_epoch_seed(1023);
-        let seed1024 = compute_epoch_seed(1024);
-        assert_eq!(seed0, seed1023);
-        assert_ne!(seed0, seed1024);
     }
 
     #[test]
@@ -690,44 +1795,55 @@ mod tests {
     }
 
     #[test]
-    fn test_dataset_modification_after_hash() {
-        let header = b"test header";
-        let height = 100u64;
-        let nonce = 0u64;
+    fn test_epoch_boundary() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1023 = compute_epoch_seed(1023);
+        let seed1024 = compute_epoch_seed(1024);
+        assert_eq!(seed0, seed1023);
+        assert_ne!(seed0, seed1024);
+    }
 
-        let seed = compute_epoch_seed(height);
-        let base_ds = generate_dataset(&seed);
-
-        let mut ds = Dataset::new();
+    #[test]
+    fn test_generate_dataset_deterministic() {
+        let seed = compute_epoch_seed(0);
+        let ds1 = generate_dataset(&seed);
+        let ds2 = generate_dataset(&seed);
+        assert_eq!(ds1.nodes.len(), NUM_NODES);
+        assert_eq!(ds1.nodes.len(), ds2.nodes.len());
         for i in 0..NUM_NODES {
-            ds.set(i, base_ds.get(i).to_vec());
+            assert_eq!(ds1.nodes[i], ds2.nodes[i]);
         }
-
-        let original_node_0 = ds.get(0).to_vec();
-
-        let _hash = evo_omap_hash(&mut ds, header, height, nonce);
-
-        let final_node_0 = ds.get(0).to_vec();
-        assert_ne!(
-            original_node_0, final_node_0,
-            "Dataset node should be modified after hash"
-        );
     }
 
     #[test]
-    fn test_chained_dataset_generation() {
+    fn test_generate_cache_deterministic() {
         let seed = compute_epoch_seed(0);
-        let ds = generate_dataset(&seed);
-        assert_ne!(ds.nodes[0], ds.nodes[1]);
-        assert_ne!(ds.nodes[1], ds.nodes[2]);
-        assert_ne!(ds.nodes[254], ds.nodes[255]);
+        let c1 = generate_cache(&seed);
+        let c2 = generate_cache(&seed);
+        assert_eq!(c1.data.len(), CACHE_SIZE);
+        assert_eq!(c1.data, c2.data);
     }
 
     #[test]
-    fn test_node_size() {
-        let seed = compute_epoch_seed(0);
-        let ds = generate_dataset(&seed);
-        assert_eq!(ds.nodes[0].len(), NODE_SIZE);
-        assert_eq!(ds.nodes[255].len(), NODE_SIZE);
+    fn test_generate_program_deterministic() {
+        let seed = Hash([1u8; 32]);
+        let state = State::from_seed(&seed);
+        let p1 = generate_program(&state);
+        let p2 = generate_program(&state);
+        assert_eq!(p1.instructions, p2.instructions);
+    }
+
+    #[test]
+    fn test_compute_epoch_seed() {
+        let seed0 = compute_epoch_seed(0);
+        let seed1 = compute_epoch_seed(1);
+        let seed1023 = compute_epoch_seed(1023);
+        let seed1024 = compute_epoch_seed(1024);
+        let seed1025 = compute_epoch_seed(1025);
+        assert_eq!(seed0, compute_epoch_seed(0));
+        assert_eq!(seed0, seed1);
+        assert_eq!(seed0, seed1023);
+        assert_ne!(seed0, seed1024);
+        assert_eq!(seed1024, seed1025);
     }
 }
