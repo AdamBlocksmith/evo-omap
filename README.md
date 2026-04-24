@@ -84,10 +84,12 @@ At each of `T = 4096` steps:
 2. **Program Generation**: Derive 8 instructions from state:
    ```
    For i = 0 to 7:
-       selector = wᵢ
-       op = (selector >> (i × 4)) & 0x07
-       dst = (selector >> 16) & 0x07
-       src = (selector >> 19) & 0x7F
+       word_idx = i mod 8
+       bit_offset = (i mod 8) × 8
+       selector = w[word_idx]
+       op = (selector >> bit_offset) & 0x07
+       dst = (selector >> (bit_offset + 3)) & 0x07
+       src = (selector >> (bit_offset + 6)) & 0x7F
    ```
 
 3. **Instruction Execution**: Each instruction accesses `node[src mod 128]`:
@@ -105,10 +107,12 @@ At each of `T = 4096` steps:
 4. **Branch Application**: Select branch variant and mix:
    ```
    variant = w₀ mod 4
-   input = DOMAIN_BRANCH ‖ step ‖ variant
-   if variant == 1: input ‖= node1[0..32]
-   if variant == 2: input ‖= node2[0..32]
-   if variant == 3: input ‖= node1[0..32] ‖ node2[0..32]
+   input = DOMAIN_BRANCH ‖ step ‖ variant ‖ state
+   All variants include state bytes followed by node data:
+   - variant 0: state ‖ node1[0..32]
+   - variant 1: state ‖ node1[0..32] ‖ node2[0..32]
+   - variant 2: state ‖ node2[0..32] ‖ node1[0..32]
+   - variant 3: state ‖ node1[0..32] ‖ node2[0..32]
    output = XOF(input, 64)
    for j = 0 to 7: wⱼ = wⱼ ⊕ output[j×8:(j+1)×8]
    ```

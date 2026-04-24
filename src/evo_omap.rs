@@ -638,6 +638,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn test_commitment_hash_affects_final_hash() {
+        let header = b"commitment test header";
+        let height = 100u64;
+        let nonce = 42u64;
+
+        let seed = compute_epoch_seed(height);
+        let mut dataset = generate_dataset(&seed);
+
+        let hash1 = evo_omap_hash(&mut dataset, header, height, nonce);
+
+        let seed2 = compute_epoch_seed(height.wrapping_add(1));
+        let mut dataset2 = generate_dataset(&seed2);
+        let hash2 = evo_omap_hash(&mut dataset2, header, height, nonce);
+
+        assert_ne!(hash1, hash2, "Different epoch seeds must produce different hashes");
+
+        let mut dataset3 = generate_dataset(&seed);
+        let hash3 = evo_omap_hash(&mut dataset3, b"different header", height, nonce);
+
+        assert_ne!(hash1, hash3, "Different headers must produce different hashes");
+    }
+
+    #[test]
     fn test_dataset_generation_deterministic() {
         let seed = compute_epoch_seed(0);
         let ds1 = generate_dataset(&seed);
@@ -773,15 +797,15 @@ mod tests {
 
         let mut expected_data = Vec::new();
         expected_data.extend_from_slice(DOMAIN_SEED);
+        expected_data.extend_from_slice(&(header.len() as u64).to_le_bytes());
         expected_data.extend_from_slice(header);
         expected_data.extend_from_slice(&height.to_le_bytes());
         expected_data.extend_from_slice(&nonce.to_le_bytes());
 
         let expected = blake3_256(&expected_data);
+        let actual = compute_mining_seed(header, height, nonce);
 
-        let seed = compute_epoch_seed(height);
-        let _state = State::from_seed(&expected);
-        let _derived_seed = State::from_seed(&seed);
+        assert_eq!(expected, actual);
     }
 
     #[test]
@@ -789,20 +813,8 @@ mod tests {
         let header = b"test header";
         let height = 100u64;
 
-        let mut data1 = Vec::new();
-        data1.extend_from_slice(DOMAIN_SEED);
-        data1.extend_from_slice(header);
-        data1.extend_from_slice(&height.to_le_bytes());
-        data1.extend_from_slice(&0u64.to_le_bytes());
-
-        let mut data2 = Vec::new();
-        data2.extend_from_slice(DOMAIN_SEED);
-        data2.extend_from_slice(header);
-        data2.extend_from_slice(&height.to_le_bytes());
-        data2.extend_from_slice(&1u64.to_le_bytes());
-
-        let seed1 = blake3_256(&data1);
-        let seed2 = blake3_256(&data2);
+        let seed1 = compute_mining_seed(header, height, 0);
+        let seed2 = compute_mining_seed(header, height, 1);
 
         assert_ne!(seed1, seed2);
     }
@@ -812,20 +824,8 @@ mod tests {
         let height = 100u64;
         let nonce = 42u64;
 
-        let mut data1 = Vec::new();
-        data1.extend_from_slice(DOMAIN_SEED);
-        data1.extend_from_slice(b"header1");
-        data1.extend_from_slice(&height.to_le_bytes());
-        data1.extend_from_slice(&nonce.to_le_bytes());
-
-        let mut data2 = Vec::new();
-        data2.extend_from_slice(DOMAIN_SEED);
-        data2.extend_from_slice(b"header2");
-        data2.extend_from_slice(&height.to_le_bytes());
-        data2.extend_from_slice(&nonce.to_le_bytes());
-
-        let seed1 = blake3_256(&data1);
-        let seed2 = blake3_256(&data2);
+        let seed1 = compute_mining_seed(b"header1", height, nonce);
+        let seed2 = compute_mining_seed(b"header2", height, nonce);
 
         assert_ne!(seed1, seed2);
     }
