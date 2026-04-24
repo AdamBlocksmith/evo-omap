@@ -70,6 +70,20 @@ The state `W` is 64 bytes (512 bits), interpreted as 8 × unsigned 64-bit intege
 W = [w₀, w₁, ..., w₇]
 ```
 
+### State Initialization
+
+The initial state is derived from the block header, height, and nonce. The header is truncated to 256 bytes (`MAX_HEADER_SIZE`). A length prefix prevents length-extension attacks:
+```
+state = XOF(H(DOMAIN_SEED ‖ len(header)_u64_le ‖ header[0..256] ‖ height_u64_le ‖ nonce_u64_le), 64)
+```
+
+### Mining Seed
+
+The mining seed derivation is identical to state initialization:
+```
+mining_seed = H(DOMAIN_SEED ‖ len(header)_u64_le ‖ header[0..256] ‖ height_u64_le ‖ nonce_u64_le)
+```
+
 ### Program Execution
 
 At each of `T = 4096` steps:
@@ -107,15 +121,15 @@ At each of `T = 4096` steps:
 4. **Branch Application**: Select branch variant and mix:
    ```
    variant = w₀ mod 4
-   input = DOMAIN_BRANCH ‖ step ‖ variant ‖ state
-    All variants include state bytes followed by node data:
+   input = DOMAIN_BRANCH ‖ step_u32_le ‖ variant_u8 ‖ state
+   All variants include state bytes followed by node data:
    - variant 0: state ‖ node1[0..32]
    - variant 1: state ‖ node1[0..32] ‖ node2[0..32]
    - variant 2: state ‖ node2[0..32] ‖ node1[0..32]
    - variant 3: state ‖ node2[0..32] ‖ node1[0..32] ‖ node2[0..32]
    output = XOF(input, 64)
    for j = 0 to 7: wⱼ = wⱼ ⊕ output[j×8:(j+1)×8]
-    ```
+   ```
 
 5. **Node Write**: Compute and store written node:
    ```
@@ -125,7 +139,12 @@ At each of `T = 4096` steps:
 
 6. **Commitment Update**:
    ```
-   commitment = H(commitment ‖ step ‖ state[0..4])
+   commitment = H(commitment ‖ step_u64_le ‖ state[0..32])
+   ```
+
+7. **Initial Commitment**: Before the first step, initialize:
+   ```
+   commitment = H(DOMAIN_COMMITMENT ‖ height_u64_le)
    ```
 
 ### Finalization
@@ -192,18 +211,17 @@ The theoretical ASIC advantage is **bounded by memory**, not unbounded as with p
 | `OPERAND_WORDS` | 128 | Fixed | Words per node for operand access |
 | `BRANCH_WAYS` | 4 | 2, 4, 8 | Branch variants |
 | `EPOCH_LENGTH` | 1,024 | 128 - 8192 | Blocks per epoch |
-| `CACHE_SIZE` | 33,554,432 | ~1/8 dataset | Light verification cache |
+| `MAX_HEADER_SIZE` | 256 | Fixed | Maximum header bytes hashed |
 
 ### Light Verification
 
-Light verification uses a 32 MiB cache to reconstruct nodes on-demand. The cache is generated as:
+Light verification reconstructs nodes on-demand by walking the dataset node chain from node 0, caching previously-computed original nodes. Modified nodes (from write steps) are tracked separately in a modification log. This approach:
 
-```
-For i = 0 to 511:
-    cache_block[i] = XOF(H(DOMAIN_CACHE ‖ epoch_seed ‖ i), 65536)
-```
+- Requires no pre-generated cache (saves 32 MiB)
+- Trades computation for memory
+- Must recompute nodes that the full verification would have modified
 
-Nodes are reconstructed from cache as needed, trading computation for memory.
+The `LightDataset` implementation caches original nodes lazily and tracks mutations, ensuring the memory commitment computation includes the same node state as full verification.
 
 ## Reference Implementation
 
