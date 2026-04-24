@@ -793,9 +793,10 @@ pub fn mine_parallel(
         .into_par_iter()
         .find_map_any(|(start_nonce, end_nonce)| {
             let mut buffers = HashBuffers::new();
+            let mut dataset = CowDataset::new(&base_dataset);
 
             for nonce in start_nonce..end_nonce {
-                let mut dataset = CowDataset::new(&base_dataset);
+                dataset.reset();
 
                 let pow_hash = evo_omap_hash_with_buffers(&mut dataset, &header, height, nonce, &mut buffers);
 

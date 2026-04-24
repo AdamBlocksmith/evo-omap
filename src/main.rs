@@ -246,14 +246,21 @@ fn main() {
 
             // Full verification benchmark
             println!("Full verification ({} iterations):", iterations.min(5));
+            let mut cow_ds_full = CowDataset::new(&dataset);
+            let mut buffers_full = HashBuffers::new();
+            let full_iterations = iterations.min(5);
             let full_start = Instant::now();
-            for nonce in 0..iterations.min(5) {
-                verify(&header, height, nonce, difficulty);
+            for nonce in 0..full_iterations {
+                cow_ds_full.reset();
+                let pow_hash = evo_omap_hash_with_buffers(&mut cow_ds_full, &header, height, nonce, &mut buffers_full);
+                let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
+                let target_full = u64::MAX / difficulty;
+                let _valid = hash_int < target_full;
             }
             let full_time = full_start.elapsed();
             println!("  Total time: {:.3} ms", full_time.as_secs_f64() * 1000.0);
-            println!("  Per verification: {:.3} ms", full_time.as_secs_f64() * 1000.0 / iterations.min(5) as f64);
-            println!("  Verification/s: {:.2}", iterations.min(5) as f64 / full_time.as_secs_f64());
+            println!("  Per verification: {:.3} ms", full_time.as_secs_f64() * 1000.0 / full_iterations as f64);
+            println!("  Verification/s: {:.2}", full_iterations as f64 / full_time.as_secs_f64());
         }
 
         _ => {
