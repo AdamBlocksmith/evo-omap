@@ -132,8 +132,8 @@ At each of `T = 4096` steps:
 
 ```
 state_summary = H(W)
-merkle_root = H(DOMAIN_MEMORY ‖ Node[0] ‖ ... ‖ Node[N-1])
-final_hash = SHA3-256(state_summary ‖ merkle_root)
+memory_commitment = H(DOMAIN_MEMORY ‖ Node[0] ‖ ... ‖ Node[N-1])
+final_hash = SHA3-256(state_summary ‖ memory_commitment)
 ```
 
 ## Memory-Hardness Analysis

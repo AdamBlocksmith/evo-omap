@@ -5,7 +5,7 @@
 
 pub use crate::hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 pub use crate::public_spec::{
-    Instruction,
+    Instruction, Program,
     STATE_SIZE as STATE_SIZE_SPEC,
     PROGRAM_LENGTH_MIN, PROGRAM_LENGTH_MAX,
     BRANCH_WAYS_MIN, BRANCH_WAYS_MAX,
@@ -80,11 +80,6 @@ pub trait DatasetLike {
     fn get(&self, index: usize) -> &[u8];
     fn set(&mut self, index: usize, node: Vec<u8>);
     fn as_node_slice(&self) -> Vec<&[u8]>;
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Program {
-    pub instructions: Vec<Instruction>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -211,6 +206,62 @@ impl<'a> DatasetLike for CowDataset<'a> {
     }
 }
 
+pub struct LightDataset {
+    epoch_seed: Hash,
+    cached_nodes: Vec<Option<Vec<u8>>>,
+}
+
+impl LightDataset {
+    pub fn new(epoch_seed: &Hash) -> Self {
+        Self {
+            epoch_seed: epoch_seed.clone(),
+            cached_nodes: vec![None; NUM_NODES],
+        }
+    }
+
+    fn reconstruct_node(&self, index: usize) -> Vec<u8> {
+        let prev_node = if index == 0 {
+            Vec::new()
+        } else {
+            self.get(index - 1).to_vec()
+        };
+        let index_bytes = (index as u64).to_le_bytes();
+        let epoch_seed_bytes = self.epoch_seed.as_ref();
+        let mut data = Vec::with_capacity(48 + NODE_SIZE);
+        data.extend_from_slice(DOMAIN_NODE);
+        data.extend_from_slice(epoch_seed_bytes);
+        data.extend_from_slice(&prev_node);
+        data.extend_from_slice(&index_bytes);
+        blake3_xof(&data, NODE_SIZE)
+    }
+}
+
+impl DatasetLike for LightDataset {
+    fn get(&self, index: usize) -> &[u8] {
+        if self.cached_nodes[index].is_none() {
+            let node = self.reconstruct_node(index);
+            unsafe {
+                let ptr = self.cached_nodes.as_ptr() as *mut Option<Vec<u8>>;
+                let mut_ref = std::slice::from_raw_parts_mut(ptr, NUM_NODES);
+                mut_ref[index] = Some(node);
+            }
+        }
+        self.cached_nodes[index].as_ref().unwrap()
+    }
+
+    fn set(&mut self, index: usize, node: Vec<u8>) {
+        self.cached_nodes[index] = Some(node);
+    }
+
+    fn as_node_slice(&self) -> Vec<&[u8]> {
+        let mut result = Vec::with_capacity(NUM_NODES);
+        for i in 0..NUM_NODES {
+            result.push(self.get(i));
+        }
+        result
+    }
+}
+
 fn compute_epoch_number(height: u64) -> u64 {
     height / EPOCH_LENGTH
 }
@@ -280,17 +331,6 @@ pub fn generate_cache(seed: &Hash) -> Cache {
     }
 
     cache
-}
-
-fn reconstruct_node(_cache: &Cache, epoch_seed: &Hash, index: usize, prev_node: &[u8]) -> Vec<u8> {
-    let index_bytes = (index as u64).to_le_bytes();
-    let epoch_seed_bytes = epoch_seed.as_ref();
-    let mut data = Vec::with_capacity(48 + NODE_SIZE);
-    data.extend_from_slice(DOMAIN_NODE);
-    data.extend_from_slice(epoch_seed_bytes);
-    data.extend_from_slice(prev_node);
-    data.extend_from_slice(&index_bytes);
-    blake3_xof(&data, NODE_SIZE)
 }
 
 pub fn generate_program(state: &State) -> Program {
@@ -425,7 +465,7 @@ pub fn apply_branch(
     state.write_all_u64(&state_arr);
 }
 
-pub fn compute_merkle_root(dataset: &Dataset) -> Hash {
+pub fn compute_memory_commitment(dataset: &Dataset) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN_MEMORY);
     for node in &dataset.nodes {
@@ -437,7 +477,7 @@ pub fn compute_merkle_root(dataset: &Dataset) -> Hash {
     Hash(arr)
 }
 
-pub fn compute_merkle_root_from_slice(nodes: &[&[u8]]) -> Hash {
+pub fn compute_memory_commitment_from_slice(nodes: &[&[u8]]) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN_MEMORY);
     for node in nodes {
@@ -475,8 +515,9 @@ pub fn evo_omap_hash<D: DatasetLike>(
         apply_branch(&mut state, step as u32, &node1, &node2);
 
         let state_bytes = state.as_bytes();
-        let mut write_data = Vec::with_capacity(WRITE_NODE_PREFIX + STATE_HASH_PREFIX);
+        let mut write_data = Vec::with_capacity(WRITE_NODE_PREFIX * 2 + STATE_HASH_PREFIX);
         write_data.extend_from_slice(&node1[..WRITE_NODE_PREFIX]);
+        write_data.extend_from_slice(&node2[..WRITE_NODE_PREFIX]);
         write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
         let written = blake3_xof(&write_data, NODE_SIZE);
         dataset.set(idx_write, written);
@@ -485,6 +526,7 @@ pub fn evo_omap_hash<D: DatasetLike>(
             &commitment_hash
                 .as_ref()
                 .iter()
+                .chain(&(step as u64).to_le_bytes())
                 .chain(&state_bytes[..32])
                 .cloned()
                 .collect::<Vec<u8>>(),
@@ -493,7 +535,7 @@ pub fn evo_omap_hash<D: DatasetLike>(
 
     let state_summary = blake3_256(state.as_bytes());
     let nodes = dataset.as_node_slice();
-    let memory_commitment = compute_merkle_root_from_slice(&nodes);
+    let memory_commitment = compute_memory_commitment_from_slice(&nodes);
     let final_input: Vec<u8> = state_summary
         .as_ref()
         .iter()
@@ -561,19 +603,8 @@ pub fn verify_light(
         return false;
     }
     let epoch_seed = compute_epoch_seed(height);
-    let cache = generate_cache(&epoch_seed);
-    let mut dataset = Dataset::new();
-
-    let mut prev_node = Vec::new();
-    for i in 0..NUM_NODES {
-        let node = if i == 0 {
-            generate_node0(&epoch_seed)
-        } else {
-            reconstruct_node(&cache, &epoch_seed, i, &prev_node)
-        };
-        dataset.set(i, node.clone());
-        prev_node = node;
-    }
+    let _cache = generate_cache(&epoch_seed);
+    let mut dataset = LightDataset::new(&epoch_seed);
 
     let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
     let target = u64::MAX / difficulty;
@@ -1193,7 +1224,7 @@ mod tests {
         arr.copy_from_slice(result.as_bytes());
         let expected = Hash::from_bytes(arr);
 
-        let computed = compute_merkle_root(&ds);
+        let computed = compute_memory_commitment(&ds);
 
         assert_eq!(computed, expected);
     }
@@ -1202,11 +1233,11 @@ mod tests {
     fn test_memory_commitment_changes_with_dataset() {
         let seed = compute_epoch_seed(0);
         let ds = generate_dataset(&seed);
-        let root1 = compute_merkle_root(&ds);
+        let root1 = compute_memory_commitment(&ds);
 
         let mut modified_ds = generate_dataset(&seed);
         modified_ds.nodes[0][0] ^= 0x01;
-        let root2 = compute_merkle_root(&modified_ds);
+        let root2 = compute_memory_commitment(&modified_ds);
 
         assert_ne!(root1, root2, "Changing any node must change memory commitment");
     }

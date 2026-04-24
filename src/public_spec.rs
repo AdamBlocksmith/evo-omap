@@ -200,17 +200,6 @@ pub const PROGRAM_GEN_REG_BITS: usize = 3;
 // Branching
 // =============================================================================
 
-/// Selects a branch variant based on current state.
-///
-/// The branch variant determines how state is mixed with dataset
-/// node data before the next step.
-///
-/// # Arguments
-/// * `state_words` - Current state as 8 u64 words
-/// * `branch_ways` - Number of possible branch paths (2, 4, or 8)
-///
-/// # Returns
-/// Branch variant in range [0, branch_ways)
 pub fn select_branch_variant(state_words: &[u64; 8], branch_ways: u8) -> u8 {
     (state_words[0] & ((branch_ways - 1) as u64)) as u8
 }

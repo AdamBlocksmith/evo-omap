@@ -10,7 +10,7 @@ pub use evo_omap::{
     compute_epoch_seed,
     evo_omap_hash, mine, verify, verify_light,
     derive_indices, execute_program, apply_branch, generate_program,
-    compute_merkle_root, generate_dataset, generate_cache,
+    compute_memory_commitment, generate_dataset, generate_cache,
     DatasetSpec, CacheSpec,
     STATE_SIZE_SPEC,
     PROGRAM_LENGTH_MIN, PROGRAM_LENGTH_MAX,
@@ -20,5 +20,3 @@ pub use evo_omap::{
     DOMAIN_EPOCH, DOMAIN_NODE, DOMAIN_SEED,
     DOMAIN_CACHE, DOMAIN_BRANCH, DOMAIN_COMMITMENT, DOMAIN_MEMORY,
 };
-
-pub use public_spec::Instruction as PublicInstruction;
