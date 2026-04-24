@@ -151,7 +151,7 @@ impl Instruction {
             }
             Instruction::Xor { dst, src } => {
                 let operand = node2_words[(*src as usize) % OPERAND_WORDS];
-                state[*dst as usize] = state[*dst as usize] ^ operand;
+                state[*dst as usize] ^= operand;
             }
             Instruction::Rotl { dst, src } => {
                 let amount = node1_words[(*src as usize) % OPERAND_WORDS] % 64;

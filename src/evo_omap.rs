@@ -32,17 +32,8 @@ pub struct State(pub [u8; STATE_SIZE_SPEC]);
 impl State {
     pub fn as_u64_array(&self) -> [u64; 8] {
         let mut arr = [0u64; 8];
-        for i in 0..8 {
-            arr[i] = u64::from_le_bytes([
-                self.0[i * 8],
-                self.0[i * 8 + 1],
-                self.0[i * 8 + 2],
-                self.0[i * 8 + 3],
-                self.0[i * 8 + 4],
-                self.0[i * 8 + 5],
-                self.0[i * 8 + 6],
-                self.0[i * 8 + 7],
-            ]);
+        for (i, chunk) in self.0.chunks(8).enumerate() {
+            arr[i] = u64::from_le_bytes(chunk.try_into().unwrap());
         }
         arr
     }
@@ -208,14 +199,12 @@ impl<'a> DatasetLike for CowDataset<'a> {
 
 pub struct LightDataset {
     epoch_seed: Hash,
-    cached_nodes: Vec<Option<Vec<u8>>>,
 }
 
 impl LightDataset {
     pub fn new(epoch_seed: &Hash) -> Self {
         Self {
-            epoch_seed: epoch_seed.clone(),
-            cached_nodes: vec![None; NUM_NODES],
+            epoch_seed: *epoch_seed,
         }
     }
 
@@ -223,7 +212,7 @@ impl LightDataset {
         let prev_node = if index == 0 {
             Vec::new()
         } else {
-            self.get(index - 1).to_vec()
+            self.reconstruct_node(index - 1)
         };
         let index_bytes = (index as u64).to_le_bytes();
         let epoch_seed_bytes = self.epoch_seed.as_ref();
@@ -237,28 +226,88 @@ impl LightDataset {
 }
 
 impl DatasetLike for LightDataset {
-    fn get(&self, index: usize) -> &[u8] {
-        if self.cached_nodes[index].is_none() {
-            let node = self.reconstruct_node(index);
-            unsafe {
-                let ptr = self.cached_nodes.as_ptr() as *mut Option<Vec<u8>>;
-                let mut_ref = std::slice::from_raw_parts_mut(ptr, NUM_NODES);
-                mut_ref[index] = Some(node);
-            }
-        }
-        self.cached_nodes[index].as_ref().unwrap()
+    fn get(&self, _index: usize) -> &[u8] {
+        unreachable!("LightDataset does not support direct access, use reconstruct_node")
     }
 
-    fn set(&mut self, index: usize, node: Vec<u8>) {
-        self.cached_nodes[index] = Some(node);
+    fn set(&mut self, _index: usize, _node: Vec<u8>) {
+        unreachable!("LightDataset does not support writes")
     }
 
     fn as_node_slice(&self) -> Vec<&[u8]> {
-        let mut result = Vec::with_capacity(NUM_NODES);
+        unreachable!("LightDataset does not support slice export")
+    }
+}
+
+pub fn evo_omap_hash_light(
+    dataset: &mut LightDataset,
+    header: &[u8],
+    height: u64,
+    nonce: u64,
+) -> Hash {
+    let seed = compute_mining_seed(header, height, nonce);
+    let mut state = State::from_seed(&seed);
+
+    let mut commitment_data = Vec::with_capacity(40);
+    commitment_data.extend_from_slice(DOMAIN_COMMITMENT);
+    commitment_data.extend_from_slice(&height.to_le_bytes());
+    let mut commitment_hash = blake3_256(&commitment_data);
+
+    for step in 0..NUM_STEPS {
+        let program = generate_program(&state);
+        let (idx1, idx2, idx_write) = derive_indices(&state, step as u64);
+
+        let node1 = dataset.reconstruct_node(idx1);
+        let node2 = dataset.reconstruct_node(idx2);
+
+        execute_program(&mut state, &program, &node1, &node2);
+
+        apply_branch(&mut state, step as u32, &node1, &node2);
+
+        let state_bytes = state.as_bytes();
+        let mut write_data = Vec::with_capacity(WRITE_NODE_PREFIX * 2 + STATE_HASH_PREFIX);
+        write_data.extend_from_slice(&node1[..WRITE_NODE_PREFIX]);
+        write_data.extend_from_slice(&node2[..WRITE_NODE_PREFIX]);
+        write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
+        let written = blake3_xof(&write_data, NODE_SIZE);
+        dataset.set(idx_write, written);
+
+        commitment_hash = blake3_256(
+            &commitment_hash
+                .as_ref()
+                .iter()
+                .chain(&(step as u64).to_le_bytes())
+                .chain(&state_bytes[..32])
+                .cloned()
+                .collect::<Vec<u8>>(),
+        );
+    }
+
+    let state_summary = blake3_256(state.as_bytes());
+    let memory_commitment = dataset.compute_memory_commitment();
+    let final_input: Vec<u8> = state_summary
+        .as_ref()
+        .iter()
+        .chain(commitment_hash.as_ref())
+        .chain(memory_commitment.as_ref())
+        .cloned()
+        .collect();
+
+    sha3_256(&final_input)
+}
+
+impl LightDataset {
+    fn compute_memory_commitment(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DOMAIN_MEMORY);
         for i in 0..NUM_NODES {
-            result.push(self.get(i));
+            let node = self.reconstruct_node(i);
+            hasher.update(&node);
         }
-        result
+        let result = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(result.as_bytes());
+        Hash(arr)
     }
 }
 
@@ -607,7 +656,7 @@ pub fn verify_light(
     let _cache = generate_cache(&epoch_seed);
     let mut dataset = LightDataset::new(&epoch_seed);
 
-    let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
+    let pow_hash = evo_omap_hash_light(&mut dataset, header, height, nonce);
     let target = u64::MAX / difficulty;
     let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
     hash_int < target
