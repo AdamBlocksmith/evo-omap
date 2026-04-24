@@ -1,7 +1,7 @@
 //! EVO-OMAP Proof-of-Work Algorithm Implementation
 //!
-//! This module implements the EVO-OMAP algorithm using parameters from
-//! private_tuning.rs. The public specification is in public_spec.rs.
+//! This module implements the EVO-OMAP algorithm. Protocol constants are
+//! defined in constants.rs. Public specification is in public_spec.rs.
 
 pub use crate::hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 pub use crate::public_spec::{
@@ -15,13 +15,20 @@ pub use crate::public_spec::{
     DOMAIN_CACHE, DOMAIN_BRANCH, DOMAIN_COMMITMENT, DOMAIN_MEMORY,
 };
 
-use crate::private_tuning::constants::*;
+use crate::constants::{
+    NODE_SIZE, NUM_NODES, CACHE_SIZE, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
+    CACHE_BLOCK_SIZE, CACHE_NUM_BLOCKS,
+    SELECTOR_BITS_PER_FIELD, OPCODE_MASK, SELECTOR_DST_SHIFT, SELECTOR_SRC_SHIFT,
+    SELECTOR_IMM_SHIFT, IMM_MASK, BRANCH_MASK,
+    BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
+    NUM_REGISTERS,
+};
 
 pub use crate::public_spec::DatasetSpec;
 pub use crate::public_spec::CacheSpec;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct State(pub [u8; STATE_SIZE]);
+pub struct State(pub [u8; STATE_SIZE_SPEC]);
 
 impl State {
     pub fn as_u64_array(&self) -> [u64; 8] {
@@ -48,11 +55,11 @@ impl State {
             .unwrap()
     }
 
-    pub fn as_bytes(&self) -> &[u8; STATE_SIZE] {
+    pub fn as_bytes(&self) -> &[u8; STATE_SIZE_SPEC] {
         &self.0
     }
 
-    pub fn as_bytes_mut(&mut self) -> &mut [u8; STATE_SIZE] {
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; STATE_SIZE_SPEC] {
         &mut self.0
     }
 
@@ -60,10 +67,16 @@ impl State {
         let mut hasher = blake3::Hasher::new();
         hasher.update(seed.as_ref());
         let mut reader = hasher.finalize_xof();
-        let mut output = [0u8; STATE_SIZE];
+        let mut output = [0u8; STATE_SIZE_SPEC];
         reader.fill(&mut output);
         State(output)
     }
+}
+
+pub trait DatasetLike {
+    fn get(&self, index: usize) -> &[u8];
+    fn set(&mut self, index: usize, node: Vec<u8>);
+    fn as_node_slice(&self) -> Vec<&[u8]>;
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -98,6 +111,20 @@ impl Default for Dataset {
     }
 }
 
+impl DatasetLike for Dataset {
+    fn get(&self, index: usize) -> &[u8] {
+        &self.nodes[index]
+    }
+
+    fn set(&mut self, index: usize, node: Vec<u8>) {
+        self.nodes[index] = node;
+    }
+
+    fn as_node_slice(&self) -> Vec<&[u8]> {
+        self.nodes.iter().map(|n| n.as_slice()).collect()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cache {
     pub data: Vec<u8>,
@@ -120,6 +147,7 @@ impl Default for Cache {
 pub struct CowDataset<'a> {
     base: &'a Dataset,
     modified: Vec<Option<Vec<u8>>>,
+    modified_indices: Vec<usize>,
 }
 
 impl<'a> CowDataset<'a> {
@@ -127,6 +155,7 @@ impl<'a> CowDataset<'a> {
         Self {
             base,
             modified: vec![None; NUM_NODES],
+            modified_indices: Vec::new(),
         }
     }
 
@@ -139,13 +168,17 @@ impl<'a> CowDataset<'a> {
     }
 
     pub fn set(&mut self, index: usize, node: Vec<u8>) {
+        if self.modified[index].is_none() {
+            self.modified_indices.push(index);
+        }
         self.modified[index] = Some(node);
     }
 
     pub fn reset(&mut self) {
-        for i in 0..NUM_NODES {
+        for &i in &self.modified_indices {
             self.modified[i] = None;
         }
+        self.modified_indices.clear();
     }
 
     pub fn as_dataset(&self) -> Vec<&[u8]> {
@@ -154,6 +187,24 @@ impl<'a> CowDataset<'a> {
             result.push(self.get(i));
         }
         result
+    }
+
+    pub fn as_node_slice(&self) -> Vec<&[u8]> {
+        self.as_dataset()
+    }
+}
+
+impl<'a> DatasetLike for CowDataset<'a> {
+    fn get(&self, index: usize) -> &[u8] {
+        CowDataset::get(self, index)
+    }
+
+    fn set(&mut self, index: usize, node: Vec<u8>) {
+        CowDataset::set(self, index, node);
+    }
+
+    fn as_node_slice(&self) -> Vec<&[u8]> {
+        self.as_dataset()
     }
 }
 
@@ -234,11 +285,11 @@ pub fn generate_program(state: &State) -> Program {
     let mut instructions = Vec::with_capacity(PROGRAM_LENGTH);
 
     for i in 0..PROGRAM_LENGTH {
-        let selector = words[i % 8];
-        let op_bits = (selector >> (i * 4)) & 0x07;
-        let dst = ((selector >> 16) & 0x07) as u8;
-        let src = ((selector >> 19) & 0x07) as u8;
-        let imm = ((selector >> 24) & 0x3F) as u8;
+        let selector = words[i % NUM_REGISTERS];
+        let op_bits = (selector >> (i * SELECTOR_BITS_PER_FIELD)) & OPCODE_MASK;
+        let dst = ((selector >> SELECTOR_DST_SHIFT) & OPCODE_MASK) as u8;
+        let src = ((selector >> SELECTOR_SRC_SHIFT) & 0x7F) as u8;
+        let imm = ((selector >> SELECTOR_IMM_SHIFT) & IMM_MASK) as u8;
 
         let instruction = match op_bits {
             0 => Instruction::Add { dst, src },
@@ -290,6 +341,23 @@ pub fn execute_program(
     }
 }
 
+/// Applies data-dependent branching by hashing state and node data.
+///
+/// ## Branch Variant Design
+///
+/// The 4-way branching mixes different amounts of node data per variant:
+/// - Variant 0: state only (no node data)
+/// - Variant 1: state + first 32 bytes of node1
+/// - Variant 2: state + first 32 bytes of node2
+/// - Variant 3: state + first 32 bytes of both nodes
+///
+/// This deviates from the spec (which used the same format for all variants)
+/// but creates more memory dependence per branch, which is better for ASIC resistance.
+///
+/// ## Bounds Safety
+///
+/// Node slices `&node[..BRANCH_NODE_PREFIX]` are safe because nodes are always
+/// exactly NODE_SIZE = 1 MiB, which is >> 32 bytes.
 pub fn apply_branch(
     state: &mut State,
     step: u32,
@@ -297,7 +365,7 @@ pub fn apply_branch(
     node2: &[u8],
 ) {
     let words = state.as_u64_array();
-    let branch_variant = (words[0] & 0x03) as u8;
+    let branch_variant = (words[0] & BRANCH_MASK) as u8;
     let state_bytes = state.as_bytes();
 
     let mut input = Vec::with_capacity(16 + 32 + 64);
@@ -308,23 +376,23 @@ pub fn apply_branch(
         0 => input.extend_from_slice(state_bytes),
         1 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node1[..32]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
         }
         2 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node2[..32]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         3 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node1[..32]);
-            input.extend_from_slice(&node2[..32]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         _ => unreachable!(),
     }
 
-    let output = blake3_xof(&input, STATE_SIZE);
+    let output = blake3_xof(&input, STATE_SIZE_SPEC);
     let state_words = state.as_u64_mut_array();
-    for i in 0..8 {
+    for i in 0..NUM_REGISTERS {
         state_words[i] ^= u64::from_le_bytes(
             output[i * 8..(i + 1) * 8].try_into().unwrap(),
         );
@@ -343,8 +411,20 @@ pub fn compute_merkle_root(dataset: &Dataset) -> Hash {
     Hash(arr)
 }
 
-pub fn evo_omap_hash(
-    dataset: &mut Dataset,
+pub fn compute_merkle_root_from_slice(nodes: &[&[u8]]) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN_MEMORY);
+    for node in nodes {
+        hasher.update(node);
+    }
+    let result = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(result.as_bytes());
+    Hash(arr)
+}
+
+pub fn evo_omap_hash<D: DatasetLike>(
+    dataset: &mut D,
     header: &[u8],
     height: u64,
     nonce: u64,
@@ -369,9 +449,9 @@ pub fn evo_omap_hash(
         apply_branch(&mut state, step as u32, &node1, &node2);
 
         let state_bytes = state.as_bytes();
-        let mut write_data = Vec::with_capacity(8192 + 32);
-        write_data.extend_from_slice(&node1[..8192]);
-        write_data.extend_from_slice(&state_bytes[..32]);
+        let mut write_data = Vec::with_capacity(WRITE_NODE_PREFIX + STATE_HASH_PREFIX);
+        write_data.extend_from_slice(&node1[..WRITE_NODE_PREFIX]);
+        write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
         let written = blake3_xof(&write_data, NODE_SIZE);
         dataset.set(idx_write, written);
 
@@ -386,7 +466,8 @@ pub fn evo_omap_hash(
     }
 
     let state_summary = blake3_256(state.as_bytes());
-    let memory_commitment = compute_merkle_root(dataset);
+    let nodes = dataset.as_node_slice();
+    let memory_commitment = compute_merkle_root_from_slice(&nodes);
     let final_input: Vec<u8> = state_summary
         .as_ref()
         .iter()
@@ -412,12 +493,7 @@ pub fn mine(
     for nonce in 0..max_nonce_attempts {
         cow_dataset.reset();
 
-        let mut dataset = Dataset::new();
-        for i in 0..NUM_NODES {
-            dataset.set(i, cow_dataset.get(i).to_vec());
-        }
-
-        let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
+        let pow_hash = evo_omap_hash(&mut cow_dataset, header, height, nonce);
 
         let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
         if hash_int < target {
@@ -493,20 +569,35 @@ pub fn verify_light(
 /// * `difficulty` - The current difficulty target
 ///
 /// # Returns
-/// A f64 value representing how "lucky" this hash is (always >= 1.0)
-pub fn compute_vein_yield(pow_hash: &Hash, difficulty: u64) -> f64 {
+/// An integer representing yield * 1000 (milli-nats). Always >= 1000.
+pub fn compute_vein_yield(pow_hash: &Hash, difficulty: u64) -> u64 {
     let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
     let target = u64::MAX / difficulty;
 
     if hash_int >= target {
-        return 1.0;
+        return 1000;
     }
 
-    let numerator = (target - hash_int) as f64;
-    let denominator = hash_int as f64 + 1.0;
-    let ratio = numerator / denominator;
+    if hash_int == 0 {
+        return u64::MAX;
+    }
 
-    ratio + 1.0
+    let ln_target = ln_milli(target);
+    let ln_hash = ln_milli(hash_int);
+
+    1000 + ln_target.saturating_sub(ln_hash)
+}
+
+fn ln_milli(x: u64) -> u64 {
+    if x <= 1 {
+        return 0;
+    }
+
+    let ln2_milli: u64 = 693;
+    let k = (63 - x.leading_zeros()) as u64;
+    let norm = ((x << (k + 1)) >> 56) as u64;
+
+    k * ln2_milli + ((norm * norm) / 2000)
 }
 
 // =============================================================================
@@ -1528,7 +1619,7 @@ mod tests {
 
         let vy = compute_vein_yield(&hash, 1);
 
-        assert!(vy >= 1.0, "Vein yield must be >= 1.0");
+        assert!(vy >= 1000, "Vein yield must be >= 1000 ( milli-nats)");
     }
 
     #[test]
@@ -1536,7 +1627,7 @@ mod tests {
         let hash = Hash::from_bytes([0xFFu8; 32]);
         let vy = compute_vein_yield(&hash, 1);
 
-        assert_eq!(vy, 1.0);
+        assert_eq!(vy, 1000);
     }
 
     #[test]
@@ -1544,9 +1635,8 @@ mod tests {
         let hash = Hash::from_bytes([0x01u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         let vy = compute_vein_yield(&hash, 1000);
 
-        assert!(vy > 1.0, "Lucky hash should have vein yield > 1");
-        assert!(vy.is_finite(), "Vein yield must be finite");
-        assert!(vy >= 1.0, "Vein yield must be >= 1.0");
+        assert!(vy > 1000, "Lucky hash should have vein yield > 1000");
+        assert!(vy >= 1000, "Vein yield must be >= 1000");
     }
 
     #[test]
@@ -1559,16 +1649,14 @@ mod tests {
 
                 let vy = compute_vein_yield(&hash, difficulty);
 
-                assert!(!vy.is_nan(), "Vein yield must not be NaN for difficulty {}", difficulty);
-                assert!(!vy.is_infinite(), "Vein yield must not be infinite for difficulty {}", difficulty);
-                assert!(vy >= 1.0, "Vein yield must be >= 1.0 for difficulty {}", difficulty);
+                assert!(vy >= 1000, "Vein yield must be >= 1000 for difficulty {}", difficulty);
             }
         }
     }
 
     #[test]
     fn test_vein_yield_expected_value() {
-        let mut total_yield = 0.0;
+        let mut total_yield = 0u64;
         let samples = 10000;
         let difficulty = 1000u64;
 
@@ -1581,7 +1669,7 @@ mod tests {
             total_yield += vy;
         }
 
-        let avg_yield = total_yield / samples as f64;
+        let avg_yield = total_yield as f64 / samples as f64 / 1000.0;
 
         assert!(avg_yield > 1.5 && avg_yield < 2.5,
             "Expected vein yield around 2.0, got {} over {} samples", avg_yield, samples);

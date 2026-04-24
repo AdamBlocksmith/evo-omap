@@ -52,6 +52,22 @@
 /// All state operations interpret bytes as big-endian u64 values.
 pub const STATE_SIZE: usize = 64;
 
+/// Number of state registers (8 × 64-bit = 512 bits).
+pub const NUM_REGISTERS: usize = 8;
+
+/// Number of operand u64 words per node that instructions can access.
+///
+/// Instructions access node_word[src % OPERAND_WORDS], limiting operand
+/// reads to the first 128 × 8 = 1024 bytes (1 KiB) of each 1 MiB node.
+/// This is a cache-friendly design choice for light verification.
+pub const OPERAND_WORDS: usize = 128;
+
+/// Rotation amount bit mask (6 bits for 64-bit rotate, values 0-63).
+///
+/// Rotation amounts are computed as (state[dst] & ROTATION_MASK) + imm,
+/// giving data-dependent but bounded rotation amounts.
+pub const ROTATION_MASK: u64 = 0x3F;
+
 /// Minimum program length (instructions per step).
 pub const PROGRAM_LENGTH_MIN: usize = 4;
 
@@ -122,41 +138,41 @@ impl Instruction {
     ///
     /// # Notes
     /// - All arithmetic uses wrapping to prevent overflow attacks
-    /// - Rotation amounts are data-dependent: (state[dst] & 0x3F) + imm
-    /// - Operand index uses % 128 (first 1 KiB of node) for cache friendliness
+    /// - Rotation amounts are data-dependent: (state[dst] & ROTATION_MASK) + imm
+    /// - Operand index uses % OPERAND_WORDS (first 1 KiB of node) for cache friendliness
     pub fn execute(&self, state: &mut [u64; 8], node1_words: &[u64], node2_words: &[u64]) {
         match self {
             Instruction::Add { dst, src } => {
-                let operand = node1_words[(*src as usize) % 128];
+                let operand = node1_words[(*src as usize) % OPERAND_WORDS];
                 state[*dst as usize] = state[*dst as usize].wrapping_add(operand);
             }
             Instruction::Sub { dst, src } => {
-                let operand = node2_words[(*src as usize) % 128];
+                let operand = node2_words[(*src as usize) % OPERAND_WORDS];
                 state[*dst as usize] = state[*dst as usize].wrapping_sub(operand);
             }
             Instruction::Mul { dst, src } => {
-                let operand = node1_words[(*src as usize) % 128];
+                let operand = node1_words[(*src as usize) % OPERAND_WORDS];
                 state[*dst as usize] = state[*dst as usize].wrapping_mul(operand);
             }
             Instruction::Xor { dst, src } => {
-                let operand = node2_words[(*src as usize) % 128];
+                let operand = node2_words[(*src as usize) % OPERAND_WORDS];
                 state[*dst as usize] = state[*dst as usize] ^ operand;
             }
             Instruction::Rotl { dst, imm } => {
-                let amount = (state[*dst as usize] & 0x3F).wrapping_add(*imm as u64);
+                let amount = (state[*dst as usize] & ROTATION_MASK).wrapping_add(*imm as u64);
                 state[*dst as usize] = state[*dst as usize].rotate_left(amount as u32);
             }
             Instruction::Rotr { dst, imm } => {
-                let amount = (state[*dst as usize] & 0x3F).wrapping_add(*imm as u64);
+                let amount = (state[*dst as usize] & ROTATION_MASK).wrapping_add(*imm as u64);
                 state[*dst as usize] = state[*dst as usize].rotate_right(amount as u32);
             }
             Instruction::Mulh { dst, src } => {
-                let operand = node1_words[(*src as usize) % 128] as u128;
+                let operand = node1_words[(*src as usize) % OPERAND_WORDS] as u128;
                 let wide = (state[*dst as usize] as u128).wrapping_mul(operand);
                 state[*dst as usize] = (wide >> 64) as u64;
             }
             Instruction::Swap { a, b } => {
-                state.swap(*a as usize, *b as usize);
+                state.swap(*a as usize, (*b % NUM_REGISTERS as u8) as usize);
             }
         }
     }

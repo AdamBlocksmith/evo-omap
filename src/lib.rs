@@ -1,6 +1,7 @@
 pub mod hash;
 pub mod public_spec;
 pub mod private_tuning;
+pub mod constants;
 pub mod evo_omap;
 
 pub use hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};

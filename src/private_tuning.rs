@@ -161,20 +161,3 @@ pub mod config {
         }
     }
 }
-
-// =============================================================================
-// Internal Constants
-// =============================================================================
-
-/// Internal constants for the implementation.
-pub(crate) mod constants {
-    pub const NODE_SIZE: usize = 1_048_576;
-    pub const NUM_NODES: usize = 256;
-    pub const CACHE_SIZE: usize = 33_554_432;
-    pub const NUM_STEPS: usize = 4_096;
-    pub const PROGRAM_LENGTH: usize = 8;
-    pub const EPOCH_LENGTH: u64 = 1_024;
-    pub const STATE_SIZE: usize = crate::public_spec::STATE_SIZE;
-    pub const CACHE_BLOCK_SIZE: usize = 65_536;
-    pub const CACHE_NUM_BLOCKS: usize = 512;
-}
