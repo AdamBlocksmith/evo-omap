@@ -18,8 +18,7 @@ pub use crate::public_spec::{
 use crate::constants::{
     NODE_SIZE, NUM_NODES, CACHE_SIZE, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
     CACHE_BLOCK_SIZE, CACHE_NUM_BLOCKS,
-    SELECTOR_BITS_PER_FIELD, OPCODE_MASK, SELECTOR_DST_SHIFT, SELECTOR_SRC_SHIFT,
-    BRANCH_MASK,
+    BRANCH_MASK, SRC_MASK,
     BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
     NUM_REGISTERS,
 };
@@ -48,20 +47,15 @@ impl State {
         arr
     }
 
-    pub fn as_u64_mut_array(&mut self) -> &mut [u64] {
-        let ptr = self.0.as_mut_ptr() as *mut u64;
-        assert_eq!(
-            self.0.as_ptr().align_offset(8), 0,
-            "State buffer must be 8-byte aligned for u64 access"
-        );
-        unsafe {
-            std::slice::from_raw_parts_mut(ptr, 8)
-        }
-    }
-
-    pub fn set_u64_at_index(&mut self, index: usize, value: u64) {
+    pub fn write_u64_at_index(&mut self, index: usize, value: u64) {
         let bytes = &mut self.0[index * 8..index * 8 + 8];
         bytes.copy_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_all_u64(&mut self, values: &[u64; 8]) {
+        for (i, &val) in values.iter().enumerate() {
+            self.write_u64_at_index(i, val);
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8; STATE_SIZE_SPEC] {
@@ -229,9 +223,14 @@ pub fn compute_epoch_seed(height: u64) -> Hash {
     blake3_256(&data)
 }
 
+const MAX_HEADER_SIZE: usize = 256;
+
 fn compute_mining_seed(header: &[u8], height: u64, nonce: u64) -> Hash {
+    let header_len = header.len().min(MAX_HEADER_SIZE);
+    let header = &header[..header_len];
     let mut data = Vec::with_capacity(48 + header.len());
     data.extend_from_slice(DOMAIN_SEED);
+    data.extend_from_slice(&(header.len() as u64).to_le_bytes());
     data.extend_from_slice(header);
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(&nonce.to_le_bytes());
@@ -258,7 +257,7 @@ pub fn generate_dataset(seed: &Hash) -> Dataset {
         data.extend_from_slice(DOMAIN_NODE);
         data.extend_from_slice(epoch_seed_bytes);
         data.extend_from_slice(&dataset.nodes[i - 1]);
-        data.extend_from_slice(&i.to_le_bytes());
+        data.extend_from_slice(&(i as u64).to_le_bytes());
         dataset.nodes[i] = blake3_xof(&data, NODE_SIZE);
     }
 
@@ -273,7 +272,7 @@ pub fn generate_cache(seed: &Hash) -> Cache {
         let mut data = Vec::with_capacity(48);
         data.extend_from_slice(DOMAIN_CACHE);
         data.extend_from_slice(epoch_seed_bytes);
-        data.extend_from_slice(&i.to_le_bytes());
+        data.extend_from_slice(&(i as u64).to_le_bytes());
 
         let block_hash = blake3_256(&data);
         let block_extended = blake3_xof(block_hash.as_ref(), CACHE_BLOCK_SIZE);
@@ -284,12 +283,13 @@ pub fn generate_cache(seed: &Hash) -> Cache {
 }
 
 fn reconstruct_node(_cache: &Cache, epoch_seed: &Hash, index: usize, prev_node: &[u8]) -> Vec<u8> {
+    let index_bytes = (index as u64).to_le_bytes();
     let epoch_seed_bytes = epoch_seed.as_ref();
     let mut data = Vec::with_capacity(48 + NODE_SIZE);
     data.extend_from_slice(DOMAIN_NODE);
     data.extend_from_slice(epoch_seed_bytes);
     data.extend_from_slice(prev_node);
-    data.extend_from_slice(&index.to_le_bytes());
+    data.extend_from_slice(&index_bytes);
     blake3_xof(&data, NODE_SIZE)
 }
 
@@ -298,10 +298,13 @@ pub fn generate_program(state: &State) -> Program {
     let mut instructions = Vec::with_capacity(PROGRAM_LENGTH);
 
     for i in 0..PROGRAM_LENGTH {
-        let selector = words[i % NUM_REGISTERS];
-        let op_bits = (selector >> (i * SELECTOR_BITS_PER_FIELD)) & OPCODE_MASK;
-        let dst = ((selector >> SELECTOR_DST_SHIFT) & OPCODE_MASK) as u8;
-        let src = ((selector >> SELECTOR_SRC_SHIFT) & 0x7F) as u8;
+        let word_idx = i % NUM_REGISTERS;
+        let bit_offset = (i % 8) * 8;
+        let selector = words[word_idx];
+
+        let op_bits = (selector >> bit_offset) & 0x07;
+        let dst = ((selector >> (bit_offset + 3)) & 0x07) as u8;
+        let src = ((selector >> (bit_offset + 6)) & SRC_MASK) as u8;
 
         let instruction = match op_bits {
             0 => Instruction::Add { dst, src },
@@ -350,11 +353,13 @@ pub fn execute_program(
 ) {
     let node1_words = node_as_u64_array(node1);
     let node2_words = node_as_u64_array(node2);
-    let state_words = state.as_u64_mut_array();
+    let mut state_arr = state.as_u64_array();
 
     for instruction in &program.instructions {
-        instruction.execute(state_words, &node1_words, &node2_words);
+        instruction.execute(&mut state_arr, &node1_words, &node2_words);
     }
+
+    state.write_all_u64(&state_arr);
 }
 
 /// Applies data-dependent branching by hashing state and node data.
@@ -389,14 +394,19 @@ pub fn apply_branch(
     input.extend_from_slice(&step.to_le_bytes());
     input.push(branch_variant);
     match branch_variant {
-        0 => input.extend_from_slice(state_bytes),
+        0 => {
+            input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+        }
         1 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         2 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
         }
         3 => {
             input.extend_from_slice(state_bytes);
@@ -407,12 +417,12 @@ pub fn apply_branch(
     }
 
     let output = blake3_xof(&input, STATE_SIZE_SPEC);
-    let state_words = state.as_u64_mut_array();
+    let mut state_arr = state.as_u64_array();
     for i in 0..NUM_REGISTERS {
-        state_words[i] ^= u64::from_le_bytes(
-            output[i * 8..(i + 1) * 8].try_into().unwrap(),
-        );
+        let xor_val = u64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+        state_arr[i] ^= xor_val;
     }
+    state.write_all_u64(&state_arr);
 }
 
 pub fn compute_merkle_root(dataset: &Dataset) -> Hash {
@@ -487,6 +497,7 @@ pub fn evo_omap_hash<D: DatasetLike>(
     let final_input: Vec<u8> = state_summary
         .as_ref()
         .iter()
+        .chain(commitment_hash.as_ref())
         .chain(memory_commitment.as_ref())
         .cloned()
         .collect();
@@ -669,7 +680,7 @@ mod tests {
             data.extend_from_slice(DOMAIN_NODE);
             data.extend_from_slice(seed_bytes);
             data.extend_from_slice(&ds.nodes[i - 1]);
-            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(i as u64).to_le_bytes());
 
             let expected = blake3_xof(&data, NODE_SIZE);
             assert_eq!(ds.nodes[i], expected, "Node {} should be chained from node {}", i, i - 1);
@@ -1283,7 +1294,7 @@ mod tests {
                 data.extend_from_slice(DOMAIN_NODE);
                 data.extend_from_slice(seed.as_ref());
                 data.extend_from_slice(&prev_node);
-                data.extend_from_slice(&i.to_le_bytes());
+                data.extend_from_slice(&(i as u64).to_le_bytes());
                 blake3_xof(&data, NODE_SIZE)
             };
             ds_light.set(i, node.clone());

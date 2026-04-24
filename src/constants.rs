@@ -45,17 +45,8 @@ pub const EPOCH_LENGTH: u64 = 1_024;
 // Program Generation Bit Fields
 // =============================================================================
 
-/// Number of bits per field in program selector word.
-pub const SELECTOR_BITS_PER_FIELD: usize = 4;
-
-/// Bit mask for opcode field (3 bits, values 0-7).
-pub const OPCODE_MASK: u64 = 0x07;
-
-/// Bit shift for destination register field.
-pub const SELECTOR_DST_SHIFT: usize = 16;
-
-/// Bit shift for source register field (7 bits for operand index 0-127).
-pub const SELECTOR_SRC_SHIFT: usize = 19;
+/// Bit mask for source register field (7 bits, values 0-127).
+pub const SRC_MASK: u64 = 0x7F;
 
 // =============================================================================
 // Branch Parameters

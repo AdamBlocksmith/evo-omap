@@ -166,7 +166,10 @@ impl Instruction {
                 state[*dst as usize] = (wide >> 64) as u64;
             }
             Instruction::Swap { a, b } => {
-                state.swap(*a as usize, (*b % NUM_REGISTERS as u8) as usize);
+                state.swap(
+                    (*a % NUM_REGISTERS as u8) as usize,
+                    (*b % NUM_REGISTERS as u8) as usize,
+                );
             }
         }
     }
