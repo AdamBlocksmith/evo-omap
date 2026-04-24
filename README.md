@@ -10,13 +10,12 @@ EVO-OMAP is a proof-of-work algorithm that uses execution-based memory hardness 
 
 | Property | Value |
 |----------|-------|
-| Dataset Size | Tunable (64 MiB - 1 GiB) |
-| Node Size | Tunable (64 KiB - 16 MiB) |
-| Cache Size | ~1/8 of dataset |
-| Steps per Hash | Tunable (512 - 65536) |
-| Program Length | Tunable (4 - 16 instructions) |
-| Branch Ways | Tunable (2, 4, or 8) |
-| Epoch Length | Tunable (128 - 8192 blocks) |
+| Dataset Size | 256 MiB (configurable) |
+| Node Size | 1 MiB (configurable) |
+| Cache Size | 32 MiB (configurable) |
+| Steps per Hash | 4,096 (configurable) |
+| Program Length | 8 instructions (configurable) |
+| Epoch Length | 1,024 blocks (configurable) |
 | Inner Hash | Blake3-256 |
 | Final Hash | SHA3-256 |
 
@@ -27,73 +26,54 @@ EVO-OMAP is a proof-of-work algorithm that uses execution-based memory hardness 
 Each hash attempt:
 
 1. **Seed Generation**: Derive epoch seed from block height
-2. **Dataset Generation**: Generate N chained nodes using Blake3 XOF
+2. **Dataset Generation**: Generate 256 chained nodes using Blake3 XOF
 3. **State Initialization**: Derive 64-byte state from header + height + nonce
-4. **Execution Loop** (N steps):
-   - Generate program from current state
+4. **Execution Loop** (4,096 steps):
+   - Generate program from current state (8 instructions)
    - Derive dataset indices from current state
-   - Read two nodes from dataset
-   - Execute superscalar program (8 instructions)
-   - Apply 4-way data-dependent branch
+   - Read two nodes from dataset (operand access: src % 128)
+   - Execute superscalar program
+   - Apply 4-way data-dependent branch (XOR mix)
    - Write one node back to dataset
    - Update rolling commitment
 5. **Finalization**: Hash state summary with dataset commitment
 
 ### Instruction Set
 
-The algorithm supports 8 instruction types:
+All 8 instruction types access node data for memory-hardness:
 
-| Instruction | Operation | ASIC Impact |
-|-------------|-----------|-------------|
-| ADD | Wrapping addition | Low |
-| SUB | Wrapping subtraction | Low |
-| MUL | Wrapping multiplication | Medium |
-| XOR | Bitwise XOR | Low |
-| ROTL | Data-dependent left rotation | High |
-| ROTR | Data-dependent right rotation | High |
-| MULH | High 64 bits of 128-bit multiply | Very High |
-| SWAP | Exchange two registers | Low |
+| Instruction | Operation | Source |
+|-------------|-----------|--------|
+| ADD | Wrapping addition | node1[src % 128] |
+| SUB | Wrapping subtraction | node2[src % 128] |
+| MUL | Wrapping multiplication | node1[src % 128] |
+| XOR | Bitwise XOR | node2[src % 128] |
+| ROTL | Data-dependent left rotation | node1[src % 128] % 64 |
+| ROTR | Data-dependent right rotation | node2[src % 128] % 64 |
+| MULH | High 64 bits of 128-bit multiply | node1[src % 128] |
+| SWAP | Exchange two registers | register file only |
 
 ### Security Features
 
-1. **Memory Hardness**: Large mutable dataset requires RAM
-2. **Data-Dependent Branching**: Prevents fixed hardware pipelines
-3. **Area-Expensive Operations**: MULH and rotations cost silicon
-4. **Sequential Dataset Generation**: Cannot precompute in parallel
-5. **State Entanglement**: Each step depends on all prior execution
+1. **Memory Hardness**: 256 MiB mutable dataset requires RAM
+2. **Data-Dependent Branching**: 4-way branch depends on node data
+3. **All Instructions Access Memory**: ROT reads node_word for rotation amount
+4. **Area-Expensive Operations**: MULH costs significant silicon
+5. **Sequential Dataset Generation**: Cannot precompute nodes in parallel
+6. **State Entanglement**: Each step depends on all prior execution
 
-## Public Specification
+## Public Constants
 
-The algorithm specification is **public** and includes:
-
-- Algorithm design and step order
-- Instruction set and operation semantics
-- Parameter valid ranges
-- Security properties and rationale
-- Domain separators
-
-### Parameter Ranges
+All protocol constants are public in `src/constants.rs`:
 
 ```rust
-Node Size:      64 KiB - 16 MiB
-Dataset Nodes:  16 - 1024
-Total Memory:   1 MiB - 1 GiB
-Compute Steps:  512 - 65536
-Program Length: 4 - 16 instructions
-Epoch Length:   128 - 8192 blocks
-Branch Ways:    2, 4, or 8
+pub const NODE_SIZE: usize = 1_048_576;      // 1 MiB per node
+pub const NUM_NODES: usize = 256;            // 256 nodes
+pub const NUM_STEPS: usize = 4_096;          // 4,096 execution steps
+pub const PROGRAM_LENGTH: usize = 8;          // 8 instructions per program
+pub const OPERAND_WORDS: usize = 128;        // 128 u64 words per node (1 KiB working set)
+pub const BRANCH_WAYS: usize = 4;           // 4-way branching
 ```
-
-## Private Tuning
-
-The **specific configuration values** (exact memory size, steps, etc.) are **private** and should not be published. This prevents attackers from optimizing for a fixed configuration.
-
-Network operators should:
-
-1. Choose values within the public spec ranges
-2. Keep specific combinations private
-3. Consider versioned parameters per epoch
-4. Monitor hashrate distribution
 
 ## Implementation Structure
 
@@ -101,9 +81,9 @@ Network operators should:
 src/
 ├── hash.rs           # Blake3, SHA3-256, XOF functions
 ├── public_spec.rs   # Algorithm specification (public)
-├── private_tuning.rs # Configuration values (private)
-├── evo_omap.rs       # Core algorithm implementation
-└── main.rs           # CLI interface
+├── constants.rs     # Protocol constants (public)
+├── evo_omap.rs     # Core algorithm implementation
+└── main.rs         # CLI interface
 ```
 
 ## CLI Usage
@@ -135,35 +115,23 @@ cargo test --lib
 cargo test test_name
 ```
 
-## Performance
-
-Expected hash rates on common hardware:
-
-| Hardware | Hash Rate | Notes |
-|----------|-----------|-------|
-| CPU (Ryzen 9) | 150-300 H/s | Branch prediction helps |
-| GPU (RTX 4090) | 200-400 H/s | Warp divergence from branching |
-| ASIC (hypothetical) | 200-450 H/s | SRAM + branch unit costs |
-
-CPU:GPU ratio is typically 0.75-1.5x depending on CPU model.
-
 ## Design Rationale
 
 ### Why Memory Size?
 
-Larger memory requirements force ASICs to use expensive SRAM. The algorithm cannot be computed efficiently with DRAM due to the read-write nature and data-dependent access patterns.
+256 MiB mutable dataset forces ASICs to use expensive SRAM. DRAM cannot be used efficiently due to read-write nature and data-dependent access patterns.
 
-### Why Branching?
+### Why All Instructions Access Memory?
 
-Four-way branching prevents GPU warp efficiency and ASIC pipeline optimization. CPUs with branch prediction handle this naturally.
+ROTL/ROTR read node_word[src % 128] % 64 for rotation amount. This ensures every instruction type requires memory access, preventing ASIC pipelines from skipping memory ops.
 
-### Why MULH?
+### Why 4-Way Branching?
 
-The 128-bit multiply to get high bits requires significant silicon area on ASICs. This operation is cheap on CPUs with native 128-bit support.
+Branch variant mixes state with 0, 32, 32, or 64 bytes of node data depending on variant. This creates varying memory dependence per step.
 
 ### Why Dataset Chaining?
 
-Each node depends on the previous node, making dataset generation sequential. This prevents miners from precomputing the dataset in parallel.
+Each node depends on the previous node via Blake3 XOF, making dataset generation sequential. Miners cannot precompute the dataset in parallel.
 
 ## License
 

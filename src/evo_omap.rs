@@ -559,50 +559,6 @@ pub fn verify_light(
     hash_int < target
 }
 
-/// Computes the "vein yield" of a proof-of-work hash.
-///
-/// Vein yield measures how "lucky" a hash is — how far below the target
-/// the hash fell. A hash exactly at the target has yield = 1.
-/// A hash at MAX has yield approaching infinity.
-///
-/// This is used to measure mining luck and compute expected yields.
-///
-/// # Arguments
-/// * `pow_hash` - The proof-of-work hash output
-/// * `difficulty` - The current difficulty target
-///
-/// # Returns
-/// An integer representing yield * 1000 (milli-nats). Always >= 1000.
-pub fn compute_vein_yield(pow_hash: &Hash, difficulty: u64) -> u64 {
-    let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-    let target = u64::MAX / difficulty;
-
-    if hash_int >= target {
-        return 1000;
-    }
-
-    if hash_int == 0 {
-        return u64::MAX;
-    }
-
-    let ln_target = ln_milli(target);
-    let ln_hash = ln_milli(hash_int);
-
-    1000 + ln_target.saturating_sub(ln_hash)
-}
-
-fn ln_milli(x: u64) -> u64 {
-    if x <= 1 {
-        return 0;
-    }
-
-    let ln2_milli: u64 = 693;
-    let k = (63 - x.leading_zeros()) as u64;
-    let norm = ((x << (k + 1)) >> 56) as u64;
-
-    k * ln2_milli + ((norm * norm) / 2000)
-}
-
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -977,16 +933,17 @@ mod tests {
         assert_eq!(state[0], u64::MAX);
     }
 
-    #[test]
+#[test]
     fn test_instruction_mul_wrapping() {
         let mut state = [2u64, 0, 0, 0, 0, 0, 0, 0];
-        let node1_words = [u64::MAX, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+        let mut node1_words = [0u64; 128];
+        node1_words[0] = u64::MAX;
         let node2_words = [0u64; 128];
 
         let mul = Instruction::Mul { dst: 0, src: 0 };
         mul.execute(&mut state, &node1_words, &node2_words);
 
-        assert_eq!(state[0], u64::MAX.wrapping_mul(u64::MAX));
+        assert_eq!(state[0], 2u64.wrapping_mul(u64::MAX));
     }
 
     #[test]
@@ -1589,7 +1546,7 @@ mod tests {
     fn test_edge_case_rotr_by_0() {
         let mut state = [0x123456789ABCDEFu64, 0, 0, 0, 0, 0, 0, 0];
         let mut node1_words = [0u64; 128];
-        let mut node2_words = [0u64; 128];
+        let node2_words = [0u64; 128];
         node1_words[0] = 0;
 
         let rotr = Instruction::Rotr { dst: 0, src: 0 };
@@ -1602,7 +1559,7 @@ mod tests {
     fn test_edge_case_rotl_by_63() {
         let mut state = [1u64, 0, 0, 0, 0, 0, 0, 0];
         let mut node1_words = [0u64; 128];
-        let mut node2_words = [0u64; 128];
+        let node2_words = [0u64; 128];
         node1_words[0] = 63;
 
         let rotl = Instruction::Rotl { dst: 0, src: 0 };
@@ -1614,75 +1571,7 @@ mod tests {
     }
 
     // =============================================================================
-    // 19. VEIN YIELD TESTS
-    // =============================================================================
-
-    #[test]
-    fn test_vein_yield_always_at_least_1() {
-        let seed = compute_epoch_seed(0);
-        let mut ds = generate_dataset(&seed);
-        let hash = evo_omap_hash(&mut ds, b"vein yield test", 0, 0);
-
-        let vy = compute_vein_yield(&hash, 1);
-
-        assert!(vy >= 1000, "Vein yield must be >= 1000 ( milli-nats)");
-    }
-
-    #[test]
-    fn test_vein_yield_at_target_is_1() {
-        let hash = Hash::from_bytes([0xFFu8; 32]);
-        let vy = compute_vein_yield(&hash, 1);
-
-        assert_eq!(vy, 1000);
-    }
-
-    #[test]
-    fn test_vein_yield_very_lucky_hash() {
-        let hash = Hash::from_bytes([0x01u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        let vy = compute_vein_yield(&hash, 1000);
-
-        assert!(vy > 1000, "Lucky hash should have vein yield > 1000");
-        assert!(vy >= 1000, "Vein yield must be >= 1000");
-    }
-
-    #[test]
-    fn test_vein_yield_no_nan() {
-        for difficulty in [1u64, 100, 10000, 1_000_000] {
-            for nonce in 0..100 {
-                let seed = compute_epoch_seed(nonce);
-                let mut ds = generate_dataset(&seed);
-                let hash = evo_omap_hash(&mut ds, b"nan test", nonce, nonce);
-
-                let vy = compute_vein_yield(&hash, difficulty);
-
-                assert!(vy >= 1000, "Vein yield must be >= 1000 for difficulty {}", difficulty);
-            }
-        }
-    }
-
-    #[test]
-    fn test_vein_yield_expected_value() {
-        let mut total_yield = 0u64;
-        let samples = 10000;
-        let difficulty = 1000u64;
-
-        for nonce in 0..samples {
-            let seed = compute_epoch_seed(nonce);
-            let mut ds = generate_dataset(&seed);
-            let hash = evo_omap_hash(&mut ds, b"expected yield test", nonce, nonce);
-
-            let vy = compute_vein_yield(&hash, difficulty);
-            total_yield += vy;
-        }
-
-        let avg_yield = total_yield as f64 / samples as f64 / 1000.0;
-
-        assert!(avg_yield > 1.5 && avg_yield < 2.5,
-            "Expected vein yield around 2.0, got {} over {} samples", avg_yield, samples);
-    }
-
-    // =============================================================================
-    // 20. KNOWN-ANSWER TESTS
+    // 19. KNOWN-ANSWER TESTS
     // =============================================================================
 
     #[test]
