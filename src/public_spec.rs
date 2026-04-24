@@ -49,7 +49,8 @@
 /// State size in bytes.
 ///
 /// The state is a 64-byte vector interpreted as 8 × 64-bit words.
-/// All state operations interpret bytes as big-endian u64 values.
+/// All state operations interpret bytes as little-endian u64 values.
+/// This is explicitly little-endian for cross-platform consistency.
 pub const STATE_SIZE: usize = 64;
 
 /// Number of state registers (8 × 64-bit = 512 bits).

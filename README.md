@@ -283,26 +283,27 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 
 ## Test Vectors
 
-### Epoch Seed (height 0)
-```
-Input:  height = 0
-Output: 9b5b08a7 71d57467 ...
+Test vectors are computed dynamically in the test module (`evo_omap.rs`). Run tests with `cargo test` to verify correctness against known-answer tests.
+
+Example epoch seed test:
+```rust
+let seed = compute_epoch_seed(0);
+assert_eq!(&seed.0[..8], &[0x9bu8, 0x5bu8, 0x08u8, 0xa7u8, 0x71u8, 0xd5u8, 0x74u8, 0x67u8]);
 ```
 
-### Dataset Node 0 (epoch_seed = all zeros)
-```
-Input:  epoch_seed = 00...00, index = 0
-Output: (1024 bytes) a7f3c8b2 ...
-```
-
-Full test vectors available in `evo_omap.rs` test module.
+See `evo_omap.rs` test module for full test suite including:
+- Dataset generation determinism
+- Instruction execution correctness
+- Program generation validation
+- Domain separator collision tests
+- Edge case tests (overflow, max values)
 
 ## Academic Background
 
 EVO-OMAP builds on principles from:
 
 1. **Memory-hard functions**: Percival & Colvin (Scrypt, 2009)
-2. **Data-dependent addressing**: Ab skulls (Balloon Hashing, 2015)
+2. **Data-dependent addressing**: Boneh et al. (Balloon Hashing, 2015)
 3. **DAG-based mining**: Ethash (2014)
 4. **Execution-based PoW**: RandomJS (2018), RandomX (2019)
 
