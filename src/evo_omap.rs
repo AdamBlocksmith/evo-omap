@@ -19,7 +19,7 @@ use crate::constants::{
     NODE_SIZE, NUM_NODES, CACHE_SIZE, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
     CACHE_BLOCK_SIZE, CACHE_NUM_BLOCKS,
     SELECTOR_BITS_PER_FIELD, OPCODE_MASK, SELECTOR_DST_SHIFT, SELECTOR_SRC_SHIFT,
-    SELECTOR_IMM_SHIFT, IMM_MASK, BRANCH_MASK,
+    BRANCH_MASK,
     BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
     NUM_REGISTERS,
 };
@@ -49,10 +49,17 @@ impl State {
     }
 
     pub fn as_u64_mut_array(&mut self) -> &mut [u64; 8] {
-        let words_ptr = self.0.as_mut_ptr() as *mut u64;
-        unsafe { std::slice::from_raw_parts_mut(words_ptr, 8) }
-            .try_into()
-            .unwrap()
+        let ptr = self.0.as_mut_ptr();
+        assert_eq!(
+            ptr.align_offset(8), 0,
+            "State buffer must be 8-byte aligned for u64 access"
+        );
+        unsafe { &mut *(ptr as *mut [u64; 8]) }
+    }
+
+    pub fn set_u64_at_index(&mut self, index: usize, value: u64) {
+        let bytes = &mut self.0[index * 8..index * 8 + 8];
+        bytes.copy_from_slice(&value.to_be_bytes());
     }
 
     pub fn as_bytes(&self) -> &[u8; STATE_SIZE_SPEC] {
@@ -229,16 +236,20 @@ fn compute_mining_seed(header: &[u8], height: u64, nonce: u64) -> Hash {
     blake3_256(&data)
 }
 
-pub fn generate_dataset(seed: &Hash) -> Dataset {
-    let mut dataset = Dataset::new();
+fn generate_node0(seed: &Hash) -> Vec<u8> {
     let epoch_seed_bytes = seed.as_ref();
-
     let mut data = Vec::with_capacity(48);
     data.extend_from_slice(DOMAIN_NODE);
     data.extend_from_slice(epoch_seed_bytes);
     data.extend_from_slice(&0u64.to_le_bytes());
+    blake3_xof(&data, NODE_SIZE)
+}
 
-    dataset.nodes[0] = blake3_xof(&data, NODE_SIZE);
+pub fn generate_dataset(seed: &Hash) -> Dataset {
+    let mut dataset = Dataset::new();
+    let epoch_seed_bytes = seed.as_ref();
+
+    dataset.nodes[0] = generate_node0(seed);
 
     for i in 1..NUM_NODES {
         let mut data = Vec::with_capacity(48 + NODE_SIZE);
@@ -289,15 +300,14 @@ pub fn generate_program(state: &State) -> Program {
         let op_bits = (selector >> (i * SELECTOR_BITS_PER_FIELD)) & OPCODE_MASK;
         let dst = ((selector >> SELECTOR_DST_SHIFT) & OPCODE_MASK) as u8;
         let src = ((selector >> SELECTOR_SRC_SHIFT) & 0x7F) as u8;
-        let imm = ((selector >> SELECTOR_IMM_SHIFT) & IMM_MASK) as u8;
 
         let instruction = match op_bits {
             0 => Instruction::Add { dst, src },
             1 => Instruction::Sub { dst, src },
             2 => Instruction::Mul { dst, src },
             3 => Instruction::Xor { dst, src },
-            4 => Instruction::Rotl { dst, imm },
-            5 => Instruction::Rotr { dst, imm },
+            4 => Instruction::Rotl { dst, src },
+            5 => Instruction::Rotr { dst, src },
             6 => Instruction::Mulh { dst, src },
             7 => Instruction::Swap { a: dst, b: src },
             _ => unreachable!(),
@@ -320,10 +330,14 @@ fn node_word_count() -> usize {
     NODE_SIZE / 8
 }
 
-fn node_as_u64_array(node: &[u8]) -> &[u64] {
+fn node_as_u64_array(node: &[u8]) -> Vec<u64> {
     let word_count = node_word_count();
-    let words_ptr = node.as_ptr() as *const u64;
-    unsafe { std::slice::from_raw_parts(words_ptr, word_count) }
+    let mut words = Vec::with_capacity(word_count);
+    for i in 0..word_count {
+        let bytes = &node[i * 8..i * 8 + 8];
+        words.push(u64::from_be_bytes(bytes.try_into().unwrap()));
+    }
+    words
 }
 
 pub fn execute_program(
@@ -337,7 +351,7 @@ pub fn execute_program(
     let state_words = state.as_u64_mut_array();
 
     for instruction in &program.instructions {
-        instruction.execute(state_words, node1_words, node2_words);
+        instruction.execute(state_words, &node1_words, &node2_words);
     }
 }
 
@@ -531,18 +545,7 @@ pub fn verify_light(
     let mut prev_node = Vec::new();
     for i in 0..NUM_NODES {
         let node = if i == 0 {
-            blake3_xof(
-                &[
-                    DOMAIN_NODE,
-                    epoch_seed.as_ref(),
-                    &(0u64).to_le_bytes(),
-                ]
-                .iter()
-                .flat_map(|v| v.iter())
-                .cloned()
-                .collect::<Vec<u8>>(),
-                NODE_SIZE,
-            )
+            generate_node0(&epoch_seed)
         } else {
             reconstruct_node(&cache, &epoch_seed, i, &prev_node)
         };
@@ -1001,14 +1004,15 @@ mod tests {
     #[test]
     fn test_instruction_rotr_data_dependent() {
         let mut state = [0x01u64, 0, 0, 0, 0, 0, 0, 0];
-        let node1_words = [0u64; 128];
+        let mut node1_words = [0u64; 128];
         let node2_words = [0u64; 128];
+        node1_words[0] = 1;
 
-        let rotl = Instruction::Rotl { dst: 0, imm: 1 };
+        let rotl = Instruction::Rotl { dst: 0, src: 0 };
         rotl.execute(&mut state, &node1_words, &node2_words);
 
         let val = 0x01u64;
-        let expected = val.rotate_left((val & 0x3F).wrapping_add(1) as u32);
+        let expected = val.rotate_left((node1_words[0] % 64) as u32);
         assert_eq!(state[0], expected);
     }
 
@@ -1584,10 +1588,11 @@ mod tests {
     #[test]
     fn test_edge_case_rotr_by_0() {
         let mut state = [0x123456789ABCDEFu64, 0, 0, 0, 0, 0, 0, 0];
-        let node1_words = [0u64; 128];
-        let node2_words = [0u64; 128];
+        let mut node1_words = [0u64; 128];
+        let mut node2_words = [0u64; 128];
+        node1_words[0] = 0;
 
-        let rotr = Instruction::Rotr { dst: 0, imm: 0 };
+        let rotr = Instruction::Rotr { dst: 0, src: 0 };
         rotr.execute(&mut state, &node1_words, &node2_words);
 
         assert_eq!(state[0], 0x123456789ABCDEF);
@@ -1596,14 +1601,15 @@ mod tests {
     #[test]
     fn test_edge_case_rotl_by_63() {
         let mut state = [1u64, 0, 0, 0, 0, 0, 0, 0];
-        let node1_words = [0u64; 128];
-        let node2_words = [0u64; 128];
+        let mut node1_words = [0u64; 128];
+        let mut node2_words = [0u64; 128];
+        node1_words[0] = 63;
 
-        let rotl = Instruction::Rotl { dst: 0, imm: 63 };
+        let rotl = Instruction::Rotl { dst: 0, src: 0 };
         rotl.execute(&mut state, &node1_words, &node2_words);
 
         let val = 1u64;
-        let expected = val.rotate_left((val & 0x3F).wrapping_add(63) as u32);
+        let expected = val.rotate_left((node1_words[0] % 64) as u32);
         assert_eq!(state[0], expected);
     }
 

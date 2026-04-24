@@ -122,8 +122,8 @@ pub enum Instruction {
     Sub { dst: u8, src: u8 },
     Mul { dst: u8, src: u8 },
     Xor { dst: u8, src: u8 },
-    Rotl { dst: u8, imm: u8 },
-    Rotr { dst: u8, imm: u8 },
+    Rotl { dst: u8, src: u8 },
+    Rotr { dst: u8, src: u8 },
     Mulh { dst: u8, src: u8 },
     Swap { a: u8, b: u8 },
 }
@@ -138,8 +138,8 @@ impl Instruction {
     ///
     /// # Notes
     /// - All arithmetic uses wrapping to prevent overflow attacks
-    /// - Rotation amounts are data-dependent: (state[dst] & ROTATION_MASK) + imm
-    /// - Operand index uses % OPERAND_WORDS (first 1 KiB of node) for cache friendliness
+    /// - Rotation amounts are data-dependent: node_word[src % OPERAND_WORDS] % 64
+    /// - All arithmetic/logic instructions access node data for memory-hardness
     pub fn execute(&self, state: &mut [u64; 8], node1_words: &[u64], node2_words: &[u64]) {
         match self {
             Instruction::Add { dst, src } => {
@@ -158,12 +158,12 @@ impl Instruction {
                 let operand = node2_words[(*src as usize) % OPERAND_WORDS];
                 state[*dst as usize] = state[*dst as usize] ^ operand;
             }
-            Instruction::Rotl { dst, imm } => {
-                let amount = (state[*dst as usize] & ROTATION_MASK).wrapping_add(*imm as u64);
+            Instruction::Rotl { dst, src } => {
+                let amount = node1_words[(*src as usize) % OPERAND_WORDS] % 64;
                 state[*dst as usize] = state[*dst as usize].rotate_left(amount as u32);
             }
-            Instruction::Rotr { dst, imm } => {
-                let amount = (state[*dst as usize] & ROTATION_MASK).wrapping_add(*imm as u64);
+            Instruction::Rotr { dst, src } => {
+                let amount = node2_words[(*src as usize) % OPERAND_WORDS] % 64;
                 state[*dst as usize] = state[*dst as usize].rotate_right(amount as u32);
             }
             Instruction::Mulh { dst, src } => {
