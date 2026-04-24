@@ -18,9 +18,6 @@ pub const NODE_SIZE: usize = 1_048_576;
 /// Number of nodes in the dataset (256 nodes = 256 MiB total).
 pub const NUM_NODES: usize = 256;
 
-/// Total dataset memory requirement (NODE_SIZE * NUM_NODES = 256 MiB).
-pub const DATASET_MEMORY: usize = NODE_SIZE * NUM_NODES;
-
 /// Cache size for light verification (32 MiB).
 pub const CACHE_SIZE: usize = 33_554_432;
 
@@ -57,13 +54,6 @@ pub const BRANCH_WAYS: usize = 4;
 
 /// Bit mask for branch variant selection.
 pub const BRANCH_MASK: u64 = (BRANCH_WAYS - 1) as u64;
-
-// =============================================================================
-// Instruction Execution Parameters
-// =============================================================================
-
-/// Source register mask for Swap instruction (3 bits, values 0-7).
-pub const SWAP_REG_MASK: u8 = 0x07;
 
 // =============================================================================
 // Data Slice Sizes

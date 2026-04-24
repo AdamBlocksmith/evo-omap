@@ -450,6 +450,7 @@ pub fn apply_branch(
         }
         3 => {
             input.extend_from_slice(state_bytes);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }

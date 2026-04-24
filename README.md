@@ -108,11 +108,11 @@ At each of `T = 4096` steps:
    ```
    variant = w₀ mod 4
    input = DOMAIN_BRANCH ‖ step ‖ variant ‖ state
-   All variants include state bytes followed by node data:
+    All variants include state bytes followed by node data:
    - variant 0: state ‖ node1[0..32]
    - variant 1: state ‖ node1[0..32] ‖ node2[0..32]
    - variant 2: state ‖ node2[0..32] ‖ node1[0..32]
-   - variant 3: state ‖ node1[0..32] ‖ node2[0..32]
+   - variant 3: state ‖ node2[0..32] ‖ node1[0..32] ‖ node2[0..32]
    output = XOF(input, 64)
    for j = 0 to 7: wⱼ = wⱼ ⊕ output[j×8:(j+1)×8]
    ```
@@ -133,7 +133,7 @@ At each of `T = 4096` steps:
 ```
 state_summary = H(W)
 memory_commitment = H(DOMAIN_MEMORY ‖ Node[0] ‖ ... ‖ Node[N-1])
-final_hash = SHA3-256(state_summary ‖ memory_commitment)
+final_hash = SHA3-256(state_summary ‖ commitment_hash ‖ memory_commitment)
 ```
 
 ## Memory-Hardness Analysis
