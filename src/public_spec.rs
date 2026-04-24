@@ -192,8 +192,7 @@ pub struct Program {
 /// These define how instructions are selected from state bits:
 /// - 3 bits for operation selection (8 possible operations)
 /// - 3 bits for destination register (0-7)
-/// - 3 bits for source register (0-7)
-/// - 6 bits for immediate value (rotation amount)
+/// - 7 bits for source register index (0-127), masked with SRC_MASK
 pub const PROGRAM_GEN_OP_BITS: usize = 3;
 pub const PROGRAM_GEN_REG_BITS: usize = 3;
 

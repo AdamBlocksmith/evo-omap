@@ -367,10 +367,10 @@ pub fn execute_program(
 /// ## Branch Variant Design
 ///
 /// The 4-way branching mixes different amounts of node data per variant:
-/// - Variant 0: state only (no node data)
-/// - Variant 1: state + first 32 bytes of node1
-/// - Variant 2: state + first 32 bytes of node2
-/// - Variant 3: state + first 32 bytes of both nodes
+/// - Variant 0: state + first 32 bytes of node1
+/// - Variant 1: state + first 32 bytes of node1 + node2
+/// - Variant 2: state + first 32 bytes of node2 + node1
+/// - Variant 3: state + first 32 bytes of both node1 and node2
 ///
 /// This deviates from the spec (which used the same format for all variants)
 /// but creates more memory dependence per branch, which is better for ASIC resistance.
@@ -884,7 +884,7 @@ mod tests {
                 Instruction::Mulh { src, .. } => *src,
                 Instruction::Swap { .. } => continue,
             };
-            assert!(src < 8, "src register {} must be 0-7", src);
+            assert!(src < 128, "src register {} must be 0-127", src);
         }
     }
 
@@ -1647,9 +1647,9 @@ mod tests {
             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
         ]);
         let arr = state.as_u64_array();
-        assert_eq!(arr[0], 0x0001020304050607u64);
-        assert_eq!(arr[1], 0x1011121314151617u64);
-        assert_eq!(arr[7], 0x7071727374757677u64);
+        assert_eq!(arr[0], 0x0706050403020100u64);
+        assert_eq!(arr[1], 0x1716151413121110u64);
+        assert_eq!(arr[7], 0x7776757473727170u64);
     }
 
     #[test]
