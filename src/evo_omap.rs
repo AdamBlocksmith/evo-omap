@@ -225,20 +225,24 @@ impl LightDataset {
         blake3_xof(&data, NODE_SIZE)
     }
 
-    pub fn get_node(&mut self, index: usize) -> Vec<u8> {
-        if let Some(ref node) = self.modified_nodes[index] {
-            return node.clone();
-        }
+    fn get_original_chain_node(&mut self, index: usize) -> Vec<u8> {
         if self.original_nodes[index].is_none() {
             let prev_node = if index == 0 {
                 Vec::new()
             } else {
-                self.get_node(index - 1)
+                self.get_original_chain_node(index - 1)
             };
             let node = self.reconstruct_node_raw(&prev_node, index);
             self.original_nodes[index] = Some(node);
         }
         self.original_nodes[index].as_ref().unwrap().clone()
+    }
+
+    pub fn get_node(&mut self, index: usize) -> Vec<u8> {
+        if let Some(ref node) = self.modified_nodes[index] {
+            return node.clone();
+        }
+        self.get_original_chain_node(index)
     }
 
     pub fn set_node(&mut self, index: usize, node: Vec<u8>) {
@@ -747,8 +751,6 @@ pub fn mine(
     }
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = generate_dataset(&epoch_seed);
-    let target = u64::MAX / difficulty;
-
     let mut cow_dataset = CowDataset::new(&base_dataset);
     let mut buffers = HashBuffers::new();
     let mut attempts = 0u64;
@@ -759,8 +761,11 @@ pub fn mine(
 
         let pow_hash = evo_omap_hash_with_buffers(&mut cow_dataset, header, height, nonce, &mut buffers);
 
-        let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-        if hash_int < target {
+        let leading_zeros = pow_hash.0.iter()
+            .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+            .take_while(|&b| b == 0)
+            .count() as u64;
+        if leading_zeros >= difficulty {
             return (Some(nonce), attempts);
         }
     }
@@ -858,9 +863,10 @@ pub fn verify(
     let epoch_seed = compute_epoch_seed(height);
     let mut dataset = generate_dataset(&epoch_seed);
     let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
-    let target = u64::MAX / difficulty;
-    let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-    hash_int < target
+    pow_hash.0.iter()
+        .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+        .take_while(|&b| b == 0)
+        .count() as u64 >= difficulty
 }
 
 pub fn verify_light(
@@ -876,9 +882,10 @@ pub fn verify_light(
     let mut dataset = LightDataset::new(&epoch_seed);
 
     let pow_hash = evo_omap_hash_light(&mut dataset, header, height, nonce);
-    let target = u64::MAX / difficulty;
-    let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-    hash_int < target
+    pow_hash.0.iter()
+        .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+        .take_while(|&b| b == 0)
+        .count() as u64 >= difficulty
 }
 
 // =============================================================================
@@ -2074,7 +2081,6 @@ mod tests {
         let header = b"test header for light verification";
         let height = 50u64;
         let difficulty = 1u64;
-        let target = u64::MAX / difficulty;
 
         let seed = compute_epoch_seed(height);
         let base_ds = generate_dataset(&seed);
@@ -2086,8 +2092,11 @@ mod tests {
                 ds.set(i, base_ds.get(i).to_vec());
             }
             let hash = evo_omap_hash(&mut ds, header, height, nonce);
-            let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
-            if hash_int < target {
+            let leading_zeros = hash.0.iter()
+                .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+                .take_while(|&b| b == 0)
+                .count() as u64;
+            if leading_zeros >= difficulty {
                 found_nonce = Some(nonce);
                 break;
             }

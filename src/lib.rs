@@ -8,7 +8,8 @@ pub use hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 pub use evo_omap::{
     State, Instruction, Program, Dataset, Cache, CowDataset,
     compute_epoch_seed,
-    evo_omap_hash, evo_omap_hash_with_buffers,
+    evo_omap_hash, evo_omap_hash_with_buffers, evo_omap_hash_light,
+    LightDataset,
     mine, mine_parallel, verify, verify_light,
     derive_indices, execute_program, apply_branch, apply_branch_with_buffer, generate_program,
     compute_memory_commitment, generate_dataset, generate_cache,
