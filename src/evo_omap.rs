@@ -945,7 +945,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_commitment_hash_affects_final_hash() {
         let header = b"commitment test header";
         let height = 100u64;
@@ -956,7 +955,7 @@ mod tests {
 
         let hash1 = evo_omap_hash(&mut dataset, header, height, nonce);
 
-        let seed2 = compute_epoch_seed(height.wrapping_add(1));
+        let seed2 = compute_epoch_seed(height + EPOCH_LENGTH);
         let mut dataset2 = generate_dataset(&seed2);
         let hash2 = evo_omap_hash(&mut dataset2, header, height, nonce);
 

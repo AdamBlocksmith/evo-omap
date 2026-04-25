@@ -73,6 +73,15 @@ fn main() {
             println!("Height: {}", height);
             println!("Difficulty: {}", difficulty);
             println!("Max nonce attempts: {}", max_nonce);
+            let expected_attempts = 1u64.checked_shl(difficulty as u32)
+                .unwrap_or(u64::MAX);
+            if max_nonce < expected_attempts {
+                println!("Warning: max_nonce ({}) may be too low for difficulty {}.",
+                    max_nonce, difficulty);
+                println!("Expected attempts needed: ~{}. Consider increasing max_nonce.",
+                    expected_attempts);
+                println!();
+            }
             if parallel {
                 println!("Parallel mining with ~{} threads", num_threads);
             }

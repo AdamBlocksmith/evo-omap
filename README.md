@@ -159,23 +159,39 @@ memory_commitment = H(DOMAIN_MEMORY ‖ Node[0] ‖ ... ‖ Node[N-1])
 final_hash = SHA3-256(state_summary ‖ commitment_hash ‖ memory_commitment)
 ```
 
+### Hash Architecture
+
+EVO-OMAP uses two different hash functions with distinct roles:
+
+| Role | Function | Crate | Operations |
+|------|----------|-------|------------|
+| All internal operations | Blake3-256 / Blake3-XOF | `blake3` | Epoch seed, mining seed, node generation, rolling commitment, branch mixing, memory commitment |
+| Final PoW output only | SHA3-256 | `sha3` | The single output checked against the difficulty target |
+
+The finalization step is:
+```
+final_hash = SHA3-256(state_summary ‖ commitment_hash ‖ memory_commitment)
+```
+where every input to SHA3-256 was computed with Blake3. Using SHA3-256 (Keccak sponge) for the final step provides cryptographic diversity: an attacker would need to break both constructions to forge a proof.
+
 ### Difficulty
 
-Difficulty is defined as the **minimum number of consecutive leading zero bits** in the 32-byte SHA3-256 final hash. A nonce is valid when:
+Difficulty `D` requires the 32-byte SHA3-256 final hash to have **at least D consecutive leading zero bits**. Expected attempts = **2^D**.
 
-```
-count_leading_zero_bits(final_hash) >= difficulty
-```
+| Difficulty | Expected attempts | Acceptance rate | Block time @ 0.13 H/s | Block time @ 0.15 H/s |
+|-----------|------------------|-----------------|----------------------|----------------------|
+| 1 | 2 | ~50% | ~15 s | ~13 s |
+| 4 | 16 | ~6.25% | ~2 min | ~1.8 min |
+| 5 | 32 | ~3.1% | ~4 min | ~3.6 min |
+| 8 | 256 | ~0.39% | ~33 min | ~28 min |
+| 10 | 1,024 | ~0.098% | ~2.2 hr | ~1.9 hr |
+| 16 | 65,536 | ~0.0015% | ~140 hr | ~121 hr |
 
-| Difficulty | Required leading zero bits | Acceptance rate | Expected attempts |
-|-----------|---------------------------|-----------------|------------------|
-| 1 | ≥ 1 | ~50% | ~2 |
-| 8 | ≥ 8 | ~0.39% | ~256 |
-| 16 | ≥ 16 | ~0.0015% | ~65,536 |
-| 24 | ≥ 24 | ~5.96 × 10⁻⁶% | ~16,777,216 |
-| 32 | ≥ 32 | ~2.33 × 10⁻⁸% | ~4,294,967,296 |
+**Recommended starting difficulty: 4** for ~120-second block times.
+- At 0.13 H/s (Windows Intel): 2⁴ × 7.5 s = ~120 s per block
+- At 0.15 H/s (Mac M1): 2⁴ × 6.5 s = ~104 s per block
 
-Each additional difficulty bit halves the acceptance rate. This is equivalent to Bitcoin's leading-zero target, but measured in individual bits rather than nibbles.
+> **Important:** Always set `max_nonce` well above 2^difficulty. If `max_nonce < 2^difficulty` no nonce will be found. For difficulty 10: expected ~1,024 attempts × 7.5 s = ~2 hours. The CLI warns you if `max_nonce` is too low.
 
 > **Note:** Prior to commit `e37129f`, difficulty was computed as `hash_int < u64::MAX / difficulty` — comparing only the first 8 bytes of the hash as a u64. That formula did not correctly represent mining difficulty and made `verify()` accept nearly any nonce at low difficulty values. The leading-zero-bit check above is the correct implementation.
 
@@ -336,10 +352,14 @@ Performance optimizations for production mining:
 | Dataset caching | `DatasetCache` reuses dataset within same epoch, regenerating only on epoch boundary |
 | Shared dataset | `Arc<Dataset>` allows read-only sharing across threads without cloning |
 
-**Typical performance (release build, varies significantly by hardware):**
-- Dataset generation: ~500 ms – 8 s (once per epoch, depends on memory bandwidth)
-- Per-hash (single-threaded): ~4 s – 8 s
-- Parallel mining: ~6-7x throughput on 8-core CPU
+**Measured single-threaded performance (release build):**
+
+| Platform | Per-hash | Hashrate | Difficulty 1 | Difficulty 5 |
+|----------|----------|----------|--------------|--------------|
+| Windows Intel (desktop) | ~7.5 s | ~0.13 H/s | 15 s, nonce 1, 2 attempts | 335 s, nonce 44, 45 attempts |
+| Mac M1 (Apple Silicon) | ~6.5 s | ~0.15 H/s | 14 s, nonce 1, 2 attempts | 294 s, nonce 44, 45 attempts |
+
+Dataset generation is ~500 ms – 8 s depending on memory bandwidth (paid once per epoch).
 
 Run the built-in benchmark to measure on your hardware:
 ```bash
