@@ -827,6 +827,7 @@ pub fn mine(
 }
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub fn mine_parallel(
     header: &[u8],
@@ -840,38 +841,49 @@ pub fn mine_parallel(
     }
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = Arc::new(generate_dataset(&epoch_seed));
-    let target = u64::MAX / difficulty;
-    let header = header.to_vec();
+    let header = Arc::new(header.to_vec());
 
-    let chunks: Vec<(u64, u64)> = (0..max_nonce_attempts)
-        .collect::<Vec<_>>()
-        .chunks((max_nonce_attempts / num_threads as u64).max(1) as usize)
-        .map(|chunk| (*chunk.first().unwrap(), *chunk.last().unwrap() + 1))
-        .collect();
+    let nonce_counter = Arc::new(AtomicU64::new(0));
+    let found_flag = Arc::new(AtomicBool::new(false));
+    let found_nonce = Arc::new(AtomicU64::new(u64::MAX));
+    let total_attempts = Arc::new(AtomicU64::new(0));
 
-    let result = chunks
-        .into_par_iter()
-        .find_map_any(|(start_nonce, end_nonce)| {
-            let mut buffers = HashBuffers::new();
-            let mut dataset = CowDataset::new(&base_dataset);
-            let mut attempts = 0u64;
+    (0..num_threads).into_par_iter().for_each(|_| {
+        let mut buffers = HashBuffers::new();
+        let mut cow = CowDataset::new(&base_dataset);
 
-            for nonce in start_nonce..end_nonce {
-                dataset.reset();
-                attempts += 1;
+        loop {
+            if found_flag.load(Ordering::Relaxed) { break; }
 
-                let pow_hash = evo_omap_hash_with_buffers(&mut dataset, &header, height, nonce, &mut buffers);
+            let nonce = nonce_counter.fetch_add(1, Ordering::Relaxed);
+            if nonce >= max_nonce_attempts { break; }
 
-                let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-                if hash_int < target {
-                    return Some((Some(nonce), attempts));
-                }
+            total_attempts.fetch_add(1, Ordering::Relaxed);
+            cow.reset();
+
+            let pow_hash = evo_omap_hash_with_buffers(
+                &mut cow, &header, height, nonce, &mut buffers,
+            );
+
+            let leading_zeros = pow_hash.0.iter()
+                .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+                .take_while(|&b| b == 0)
+                .count() as u64;
+
+            if leading_zeros >= difficulty {
+                found_flag.store(true, Ordering::Relaxed);
+                found_nonce.store(nonce, Ordering::Relaxed);
+                break;
             }
-            Some((None, attempts))
-        });
+        }
+    });
 
-    let (nonce, total_attempts) = result.unwrap_or((None, 0));
-    (nonce, total_attempts)
+    let attempts = total_attempts.load(Ordering::Relaxed);
+    if found_flag.load(Ordering::Relaxed) {
+        (Some(found_nonce.load(Ordering::Relaxed)), attempts)
+    } else {
+        (None, attempts)
+    }
 }
 
 pub struct DatasetCache {
