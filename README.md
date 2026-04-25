@@ -188,11 +188,16 @@ Block times below are based on parallel hashrate since `--parallel` is recommend
 | 4 | 16 | ~6.25% | ~11 s | ~23 s |
 | 5 | 32 | ~3.1% | ~22 s | ~46 s |
 | 7 | 128 | ~0.78% | ~87 s | ~3 min |
-| 8 | 256 | ~0.39% | ~2.9 min | ~6 min |
+| 8 | 256 | ~0.39% | **292 s measured** (438 attempts, nonce 422, 1.50 H/s) | ~6 min |
 | 10 | 1,024 | ~0.098% | ~11.5 min | ~24 min |
 | 16 | 65,536 | ~0.0015% | ~12 hr | ~26 hr |
 
-**Example:** a blockchain targeting ~2-minute blocks would use difficulty 7 with a Ryzen 7 7700 miner (`--parallel`, 16 threads). The `difficulty` parameter your blockchain passes to `mine_parallel()` controls this — evo-omap itself has no block-time concept.
+**Recommended difficulty for ~120s blocks:**
+- Solo miner, Ryzen 7 7700 (`--parallel`, 16 threads): **difficulty 7–8**
+- Solo miner, Apple M1 (`--parallel`, 8 threads): **difficulty 6–7**
+- Multi-miner network: difficulty is set dynamically by the blockchain code based on observed block times — evo-omap accepts whatever value is passed in
+
+The `difficulty` parameter your blockchain passes to `mine_parallel()` controls block time — evo-omap itself has no block-time concept.
 
 > **Important:** Always set `max_nonce` well above 2^difficulty. If `max_nonce < 2^difficulty` no nonce will be found. For difficulty 10: expected ~1,024 attempts. The CLI warns you if `max_nonce` is too low.
 
