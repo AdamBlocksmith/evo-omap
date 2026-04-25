@@ -2,7 +2,7 @@
 
 ## Overview
 
-EVO-OMAP (EVOlutionary Oriented Memory-hard Algorithm for Proof-of-work) is a memory-hard proof-of-work algorithm designed to achieve equitable hashrate distribution across CPU, GPU, and ASIC hardware. Unlike hash-based PoWs (SHA-256, Scrypt), EVO-OMAP is **execution-based** — miners must execute a deterministic program that reads and writes a large memory buffer, forcing specialized hardware to include large SRAM.
+EVO-OMAP (Evolving Oriented Memory-hard Algorithm for Proof-of-work) is a memory-hard proof-of-work algorithm designed to achieve equitable hashrate distribution across CPU, GPU, and ASIC hardware. Unlike hash-based PoWs (SHA-256, Scrypt), EVO-OMAP is **execution-based** — miners must execute a deterministic program that reads and writes a large memory buffer, forcing specialized hardware to include large SRAM.
 
 ## Key Properties
 
