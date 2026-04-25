@@ -180,18 +180,21 @@ Difficulty `D` requires the 32-byte SHA3-256 final hash to have **at least D con
 
 > **Note:** EVO-OMAP is a standalone PoW library — it accepts `difficulty` as an input parameter and returns a hash. Block time targets are **not** configured in this library; they belong in the blockchain code that calls evo-omap and adjusts `difficulty` to hit its desired block interval. The timing estimates below are for documentation reference only.
 
-| Difficulty | Expected attempts | Acceptance rate | Example block time @ 0.13 H/s (Windows Intel) | Example block time @ 0.19 H/s (M1, optimized) |
-|-----------|------------------|-----------------|------------------------------------------------|------------------------------------------------|
-| 1 | 2 | ~50% | ~15 s | ~11 s |
-| 4 | 16 | ~6.25% | ~2 min | ~84 s |
-| 5 | 32 | ~3.1% | ~4 min | ~2.8 min |
-| 8 | 256 | ~0.39% | ~33 min | ~22 min |
-| 10 | 1,024 | ~0.098% | ~2.2 hr | ~1.5 hr |
-| 16 | 65,536 | ~0.0015% | ~140 hr | ~96 hr |
+Block times below are based on parallel hashrate since `--parallel` is recommended for mining.
 
-**Example:** a blockchain targeting 120-second blocks would set difficulty 4 when miners are running at ~0.13 H/s (Windows Intel), or difficulty 4 for ~84-second blocks at 0.19 H/s (M1 optimized). The `difficulty` parameter your blockchain passes to `mine()` controls this — evo-omap itself has no block-time concept.
+| Difficulty | Expected attempts | Acceptance rate | Block time @ 1.48 H/s (Ryzen 7 7700, 16 threads) | Block time @ 0.70 H/s (M1, 8 threads) |
+|-----------|------------------|-----------------|---------------------------------------------------|----------------------------------------|
+| 1 | 2 | ~50% | ~1 s | ~3 s |
+| 4 | 16 | ~6.25% | ~11 s | ~23 s |
+| 5 | 32 | ~3.1% | ~22 s | ~46 s |
+| 7 | 128 | ~0.78% | ~87 s | ~3 min |
+| 8 | 256 | ~0.39% | ~2.9 min | ~6 min |
+| 10 | 1,024 | ~0.098% | ~11.5 min | ~24 min |
+| 16 | 65,536 | ~0.0015% | ~12 hr | ~26 hr |
 
-> **Important:** Always set `max_nonce` well above 2^difficulty. If `max_nonce < 2^difficulty` no nonce will be found. For difficulty 10: expected ~1,024 attempts × 7.5 s = ~2 hours. The CLI warns you if `max_nonce` is too low.
+**Example:** a blockchain targeting ~2-minute blocks would use difficulty 7 with a Ryzen 7 7700 miner (`--parallel`, 16 threads). The `difficulty` parameter your blockchain passes to `mine_parallel()` controls this — evo-omap itself has no block-time concept.
+
+> **Important:** Always set `max_nonce` well above 2^difficulty. If `max_nonce < 2^difficulty` no nonce will be found. For difficulty 10: expected ~1,024 attempts. The CLI warns you if `max_nonce` is too low.
 
 > **Note:** Prior to commit `e37129f`, difficulty was computed as `hash_int < u64::MAX / difficulty` — comparing only the first 8 bytes of the hash as a u64. That formula did not correctly represent mining difficulty and made `verify()` accept nearly any nonce at low difficulty values. The leading-zero-bit check above is the correct implementation.
 
@@ -352,12 +355,14 @@ Performance optimizations for production mining:
 | Dataset caching | `DatasetCache` reuses dataset within same epoch, regenerating only on epoch boundary |
 | Shared dataset | `Arc<Dataset>` allows read-only sharing across threads without cloning |
 
-**Measured single-threaded performance (release build):**
+**Measured performance (release build):**
 
-| Platform | Per-hash | Hashrate | Notes |
-|----------|----------|----------|-------|
-| Windows Intel (desktop) | ~7.5 s | ~0.13 H/s | Pre-optimization baseline; not yet re-benchmarked after node-clone elimination |
-| Mac M1 (Apple Silicon) | ~5.3 s | ~0.19 H/s | After node-clone elimination (1 MiB → 16 KiB memcpy per step, +27% vs 0.15 H/s baseline) |
+| Platform | Mode | Per-hash | Hashrate | Parallel speedup |
+|----------|------|----------|----------|-----------------|
+| Windows Ryzen 7 7700 (16 cores) | Single thread | ~7.1 s | ~0.28 H/s | — |
+| Windows Ryzen 7 7700 (16 cores) | `--parallel` 16 threads | — | ~1.48 H/s | 5.3× |
+| Mac M1 (8 cores) | Single thread | ~10.5 s | ~0.19 H/s | — |
+| Mac M1 (8 cores) | `--parallel` 8 threads | — | ~0.70 H/s | 3.7× |
 
 Dataset generation is ~500 ms – 8 s depending on memory bandwidth (paid once per epoch).
 
@@ -368,11 +373,10 @@ Run the built-in benchmark to measure on your hardware:
 ```
 
 **Production recommendations:**
-- Use `mine()` (single-threaded) for correct difficulty enforcement
+- Use `mine_parallel()` (`--parallel` flag) for maximum hashrate
+- Single-threaded `mine()` is for benchmarking and verification only
 - Use `DatasetCache` to avoid regenerating dataset within same epoch
 - Use `HashBuffers` for batch hash computation
-
-> **Known issue:** `mine_parallel()` in `evo_omap.rs` still uses the old `hash_int < u64::MAX / difficulty` difficulty check (not fixed in `e37129f`). Use `mine()` for correctness; `mine_parallel()` accepts nonces that do not meet the leading-zero requirement.
 
 ## Comparison with Other PoWs
 
