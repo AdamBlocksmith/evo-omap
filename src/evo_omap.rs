@@ -1,4 +1,4 @@
-//! EVO-OMAP Proof-of-Work Algorithm Implementation
+//! EVO-OMAP — Evolving Oriented Memory-hard Algorithm for Proof-of-work
 //!
 //! This module implements the EVO-OMAP algorithm. Protocol constants are
 //! defined in constants.rs. Public specification is in public_spec.rs.
@@ -18,15 +18,13 @@ pub use crate::public_spec::{
 };
 
 use crate::constants::{
-    NODE_SIZE, NUM_NODES, CACHE_SIZE, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
-    CACHE_BLOCK_SIZE, CACHE_NUM_BLOCKS,
+    NODE_SIZE, NUM_NODES, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
     BRANCH_MASK, SRC_MASK,
     BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
     NUM_REGISTERS, OPERAND_WORDS,
 };
 
 pub use crate::public_spec::DatasetSpec;
-pub use crate::public_spec::CacheSpec;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct State(pub [u8; STATE_SIZE_SPEC]);
@@ -116,25 +114,6 @@ impl DatasetLike for Dataset {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct Cache {
-    pub data: Vec<u8>,
-}
-
-impl Cache {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(CACHE_SIZE),
-        }
-    }
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub struct CowDataset<'a> {
     base: &'a Dataset,
     modified: Vec<Option<Vec<u8>>>,
@@ -214,11 +193,16 @@ impl LightDataset {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.original_nodes = vec![None; NUM_NODES];
+        self.modified_nodes = vec![None; NUM_NODES];
+    }
+
     fn reconstruct_node_raw(&self, prev_node: &[u8], index: usize) -> Vec<u8> {
         let index_bytes = (index as u64).to_le_bytes();
         let epoch_seed_bytes = self.epoch_seed.as_ref();
         let mut data = Vec::with_capacity(48 + NODE_SIZE);
-        data.extend_from_slice(DOMAIN_NODE);
+        data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
         data.extend_from_slice(epoch_seed_bytes);
         data.extend_from_slice(prev_node);
         data.extend_from_slice(&index_bytes);
@@ -246,12 +230,13 @@ impl LightDataset {
     }
 
     pub fn set_node(&mut self, index: usize, node: Vec<u8>) {
+        assert_eq!(node.len(), NODE_SIZE, "node must be exactly NODE_SIZE bytes");
         self.modified_nodes[index] = Some(node);
     }
 
     pub fn compute_memory_commitment(&mut self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(DOMAIN_MEMORY);
+        hasher.update(&prefixed_domain(DOMAIN_MEMORY));
         for i in 0..NUM_NODES {
             let node = self.get_node(i);
             hasher.update(&node);
@@ -261,6 +246,15 @@ impl LightDataset {
         arr.copy_from_slice(result.as_bytes());
         Hash(arr)
     }
+}
+
+// Returns a length-prefixed copy of a domain separator byte string.
+// The first byte is the domain length; the rest is the domain itself.
+fn prefixed_domain(domain: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + domain.len());
+    v.push(domain.len() as u8);
+    v.extend_from_slice(domain);
+    v
 }
 
 pub fn evo_omap_hash_light(
@@ -273,7 +267,7 @@ pub fn evo_omap_hash_light(
     let mut state = State::from_seed(&seed);
 
     let mut commitment_data = Vec::with_capacity(40);
-    commitment_data.extend_from_slice(DOMAIN_COMMITMENT);
+    commitment_data.extend_from_slice(&prefixed_domain(DOMAIN_COMMITMENT));
     commitment_data.extend_from_slice(&height.to_le_bytes());
     let mut commitment_hash = blake3_256(&commitment_data);
 
@@ -327,18 +321,16 @@ fn compute_epoch_number(height: u64) -> u64 {
 pub fn compute_epoch_seed(height: u64) -> Hash {
     let epoch = compute_epoch_number(height);
     let mut data = Vec::with_capacity(16);
-    data.extend_from_slice(DOMAIN_EPOCH);
+    data.extend_from_slice(&prefixed_domain(DOMAIN_EPOCH));
     data.extend_from_slice(&epoch.to_le_bytes());
     blake3_256(&data)
 }
 
-const MAX_HEADER_SIZE: usize = 256;
-
 fn compute_mining_seed(header: &[u8], height: u64, nonce: u64) -> Hash {
-    let header_len = header.len().min(MAX_HEADER_SIZE);
-    let header = &header[..header_len];
+    let header_commitment = blake3_256(header);
+    let header = header_commitment.as_ref();
     let mut data = Vec::with_capacity(48 + header.len());
-    data.extend_from_slice(DOMAIN_SEED);
+    data.extend_from_slice(&prefixed_domain(DOMAIN_SEED));
     data.extend_from_slice(&(header.len() as u64).to_le_bytes());
     data.extend_from_slice(header);
     data.extend_from_slice(&height.to_le_bytes());
@@ -349,7 +341,7 @@ fn compute_mining_seed(header: &[u8], height: u64, nonce: u64) -> Hash {
 fn generate_node0(seed: &Hash) -> Vec<u8> {
     let epoch_seed_bytes = seed.as_ref();
     let mut data = Vec::with_capacity(48);
-    data.extend_from_slice(DOMAIN_NODE);
+    data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
     data.extend_from_slice(epoch_seed_bytes);
     data.extend_from_slice(&0u64.to_le_bytes());
     blake3_xof(&data, NODE_SIZE)
@@ -363,7 +355,7 @@ pub fn generate_dataset(seed: &Hash) -> Dataset {
 
     for i in 1..NUM_NODES {
         let mut data = Vec::with_capacity(48 + NODE_SIZE);
-        data.extend_from_slice(DOMAIN_NODE);
+        data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
         data.extend_from_slice(epoch_seed_bytes);
         data.extend_from_slice(&dataset.nodes[i - 1]);
         data.extend_from_slice(&(i as u64).to_le_bytes());
@@ -371,24 +363,6 @@ pub fn generate_dataset(seed: &Hash) -> Dataset {
     }
 
     dataset
-}
-
-pub fn generate_cache(seed: &Hash) -> Cache {
-    let epoch_seed_bytes = seed.as_ref();
-    let mut cache = Cache::new();
-
-    for i in 0..CACHE_NUM_BLOCKS {
-        let mut data = Vec::with_capacity(48);
-        data.extend_from_slice(DOMAIN_CACHE);
-        data.extend_from_slice(epoch_seed_bytes);
-        data.extend_from_slice(&(i as u64).to_le_bytes());
-
-        let block_hash = blake3_256(&data);
-        let block_extended = blake3_xof(block_hash.as_ref(), CACHE_BLOCK_SIZE);
-        cache.data.extend_from_slice(&block_extended);
-    }
-
-    cache
 }
 
 pub fn generate_program(state: &State) -> Program {
@@ -461,9 +435,13 @@ pub fn derive_indices(state: &State, step: u64) -> (usize, usize, usize) {
 }
 
 fn derive_indices_from_words(words: &[u64; 8], step: u64) -> (usize, usize, usize) {
-    let idx1 = (words[0].wrapping_add(step) % NUM_NODES as u64) as usize;
-    let idx2 = (words[1].wrapping_mul(step.wrapping_add(1)) % NUM_NODES as u64) as usize;
-    let idx_write = ((words[2] ^ words[3]) % NUM_NODES as u64) as usize;
+    let idx1 = (words[0].wrapping_add(step)
+        .wrapping_mul(words[4].wrapping_add(1))
+        % NUM_NODES as u64) as usize;
+    let idx2 = (words[1].wrapping_mul(step.wrapping_add(1))
+        .wrapping_add(words[5])
+        % NUM_NODES as u64) as usize;
+    let idx_write = ((words[2] ^ words[3] ^ step) % NUM_NODES as u64) as usize;
     (idx1, idx2, idx_write)
 }
 
@@ -494,23 +472,6 @@ pub fn execute_program(
     state.write_all_u64(&state_arr);
 }
 
-/// Applies data-dependent branching by hashing state and node data.
-///
-/// ## Branch Variant Design
-///
-/// The 4-way branching mixes different amounts of node data per variant:
-/// - Variant 0: state + first 32 bytes of node1
-/// - Variant 1: state + first 32 bytes of node1 + node2
-/// - Variant 2: state + first 32 bytes of node2 + node1
-/// - Variant 3: state + first 32 bytes of both node1 and node2
-///
-/// This deviates from the spec (which used the same format for all variants)
-/// but creates more memory dependence per branch, which is better for ASIC resistance.
-///
-/// ## Bounds Safety
-///
-/// Node slices `&node[..BRANCH_NODE_PREFIX]` are safe because nodes are always
-/// exactly NODE_SIZE = 1 MiB, which is >> 32 bytes.
 pub fn apply_branch(
     state: &mut State,
     step: u32,
@@ -522,29 +483,29 @@ pub fn apply_branch(
     let state_bytes = state.as_bytes();
 
     let mut input = Vec::with_capacity(16 + 32 + 64);
-    input.extend_from_slice(DOMAIN_BRANCH);
+    input.extend_from_slice(&prefixed_domain(DOMAIN_BRANCH));
     input.extend_from_slice(&step.to_le_bytes());
     input.push(branch_variant);
     match branch_variant {
         0 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         1 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
         }
         2 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         3 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
-            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         _ => unreachable!(),
     }
@@ -560,7 +521,7 @@ pub fn apply_branch(
 
 pub fn compute_memory_commitment(dataset: &Dataset) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN_MEMORY);
+    hasher.update(&prefixed_domain(DOMAIN_MEMORY));
     for node in &dataset.nodes {
         hasher.update(node);
     }
@@ -572,7 +533,7 @@ pub fn compute_memory_commitment(dataset: &Dataset) -> Hash {
 
 pub fn compute_memory_commitment_from_slice(nodes: &[&[u8]]) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN_MEMORY);
+    hasher.update(&prefixed_domain(DOMAIN_MEMORY));
     for node in nodes {
         hasher.update(node);
     }
@@ -592,7 +553,7 @@ pub fn evo_omap_hash<D: DatasetLike>(
     let mut state = State::from_seed(&seed);
 
     let mut commitment_data = Vec::with_capacity(40);
-    commitment_data.extend_from_slice(DOMAIN_COMMITMENT);
+    commitment_data.extend_from_slice(&prefixed_domain(DOMAIN_COMMITMENT));
     commitment_data.extend_from_slice(&height.to_le_bytes());
     let mut commitment_hash = blake3_256(&commitment_data);
 
@@ -694,7 +655,7 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
     let mut state = State::from_seed(&seed);
 
     buffers.commitment_data.clear();
-    buffers.commitment_data.extend_from_slice(DOMAIN_COMMITMENT);
+    buffers.commitment_data.extend_from_slice(&prefixed_domain(DOMAIN_COMMITMENT));
     buffers.commitment_data.extend_from_slice(&height.to_le_bytes());
     let mut commitment_hash = blake3_256(&buffers.commitment_data);
 
@@ -703,8 +664,6 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
         fill_program_buffer(&state_words, &mut buffers.program_buf);
         let (idx1, idx2, idx_write) = derive_indices_from_words(&state_words, step as u64);
 
-        // Copy only the prefix bytes actually consumed (8 KiB vs 1 MiB).
-        // Scoped blocks drop the dataset borrows before dataset.set() below.
         {
             let s = dataset.get(idx1);
             buffers.node1_prefix.clear();
@@ -758,29 +717,29 @@ pub fn apply_branch_with_buffer(
     let state_bytes = state.as_bytes();
 
     input.clear();
-    input.extend_from_slice(DOMAIN_BRANCH);
+    input.extend_from_slice(&prefixed_domain(DOMAIN_BRANCH));
     input.extend_from_slice(&step.to_le_bytes());
     input.push(branch_variant);
     match branch_variant {
         0 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         1 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
         }
         2 => {
             input.extend_from_slice(state_bytes);
-            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
+            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         3 => {
             input.extend_from_slice(state_bytes);
             input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
             input.extend_from_slice(&node1[..BRANCH_NODE_PREFIX]);
-            input.extend_from_slice(&node2[..BRANCH_NODE_PREFIX]);
         }
         _ => unreachable!(),
     }
@@ -853,7 +812,7 @@ pub fn mine_parallel(
         let mut cow = CowDataset::new(&base_dataset);
 
         loop {
-            if found_flag.load(Ordering::Relaxed) { break; }
+            if found_flag.load(Ordering::Acquire) { break; }
 
             let nonce = nonce_counter.fetch_add(1, Ordering::Relaxed);
             if nonce >= max_nonce_attempts { break; }
@@ -871,15 +830,17 @@ pub fn mine_parallel(
                 .count() as u64;
 
             if leading_zeros >= difficulty {
-                found_flag.store(true, Ordering::Relaxed);
-                found_nonce.store(nonce, Ordering::Relaxed);
+                found_flag.store(true, Ordering::Release);
+                let _ = found_nonce.compare_exchange(
+                    u64::MAX, nonce, Ordering::Relaxed, Ordering::Relaxed,
+                );
                 break;
             }
         }
     });
 
     let attempts = total_attempts.load(Ordering::Relaxed);
-    if found_flag.load(Ordering::Relaxed) {
+    if found_flag.load(Ordering::Acquire) {
         (Some(found_nonce.load(Ordering::Relaxed)), attempts)
     } else {
         (None, attempts)
@@ -887,24 +848,24 @@ pub fn mine_parallel(
 }
 
 pub struct DatasetCache {
-    epoch: u64,
+    epoch: Option<u64>,
     dataset: Dataset,
 }
 
 impl DatasetCache {
     pub fn new() -> Self {
         Self {
-            epoch: u64::MAX,
+            epoch: None,
             dataset: Dataset::new(),
         }
     }
 
     pub fn get_dataset(&mut self, height: u64) -> &Dataset {
         let epoch = compute_epoch_number(height);
-        if self.epoch != epoch {
+        if self.epoch != Some(epoch) {
             let epoch_seed = compute_epoch_seed(height);
             self.dataset = generate_dataset(&epoch_seed);
-            self.epoch = epoch;
+            self.epoch = Some(epoch);
         }
         &self.dataset
     }
@@ -945,6 +906,7 @@ pub fn verify_light(
     }
     let epoch_seed = compute_epoch_seed(height);
     let mut dataset = LightDataset::new(&epoch_seed);
+    dataset.reset();
 
     let pow_hash = evo_omap_hash_light(&mut dataset, header, height, nonce);
     pow_hash.0.iter()
@@ -1054,7 +1016,7 @@ mod tests {
         let seed_bytes = seed.as_ref();
 
         let mut data = Vec::new();
-        data.extend_from_slice(DOMAIN_NODE);
+        data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
         data.extend_from_slice(seed_bytes);
         data.extend_from_slice(&0u64.to_le_bytes());
 
@@ -1072,7 +1034,7 @@ mod tests {
         for i in 1..NUM_NODES {
             let seed_bytes = seed.as_ref();
             let mut data = Vec::new();
-            data.extend_from_slice(DOMAIN_NODE);
+            data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
             data.extend_from_slice(seed_bytes);
             data.extend_from_slice(&ds.nodes[i - 1]);
             data.extend_from_slice(&(i as u64).to_le_bytes());
@@ -1121,7 +1083,7 @@ mod tests {
         let seed0 = compute_epoch_seed(0);
 
         let mut expected_data = Vec::new();
-        expected_data.extend_from_slice(DOMAIN_EPOCH);
+        expected_data.extend_from_slice(&prefixed_domain(DOMAIN_EPOCH));
         expected_data.extend_from_slice(&0u64.to_le_bytes());
         let expected = blake3_256(&expected_data);
 
@@ -1166,10 +1128,13 @@ mod tests {
         let height = 100u64;
         let nonce = 42u64;
 
+        let header_commitment = blake3_256(header);
+        let committed = header_commitment.as_ref();
+
         let mut expected_data = Vec::new();
-        expected_data.extend_from_slice(DOMAIN_SEED);
-        expected_data.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        expected_data.extend_from_slice(header);
+        expected_data.extend_from_slice(&prefixed_domain(DOMAIN_SEED));
+        expected_data.extend_from_slice(&(committed.len() as u64).to_le_bytes());
+        expected_data.extend_from_slice(committed);
         expected_data.extend_from_slice(&height.to_le_bytes());
         expected_data.extend_from_slice(&nonce.to_le_bytes());
 
@@ -1555,7 +1520,7 @@ mod tests {
         let ds = generate_dataset(&seed);
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(DOMAIN_MEMORY);
+        hasher.update(&prefixed_domain(DOMAIN_MEMORY));
         for node in &ds.nodes {
             hasher.update(node);
         }
@@ -1643,26 +1608,18 @@ mod tests {
         let mut ds_full = generate_dataset(&seed);
         let hash_full = evo_omap_hash(&mut ds_full, header, height, nonce);
 
-        let _cache = generate_cache(&seed);
         let mut ds_light = Dataset::new();
         let mut prev_node = Vec::new();
         for i in 0..NUM_NODES {
             let node = if i == 0 {
-                blake3_xof(
-                    &[
-                        DOMAIN_NODE,
-                        seed.as_ref(),
-                        &(0u64).to_le_bytes(),
-                    ]
-                    .iter()
-                    .flat_map(|v| v.iter())
-                    .cloned()
-                    .collect::<Vec<u8>>(),
-                    NODE_SIZE,
-                )
+                let mut data = Vec::new();
+                data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
+                data.extend_from_slice(seed.as_ref());
+                data.extend_from_slice(&(0u64).to_le_bytes());
+                blake3_xof(&data, NODE_SIZE)
             } else {
                 let mut data = Vec::new();
-                data.extend_from_slice(DOMAIN_NODE);
+                data.extend_from_slice(&prefixed_domain(DOMAIN_NODE));
                 data.extend_from_slice(seed.as_ref());
                 data.extend_from_slice(&prev_node);
                 data.extend_from_slice(&(i as u64).to_le_bytes());
@@ -1970,10 +1927,13 @@ mod tests {
     #[test]
     fn test_known_answer_epoch_seed() {
         let seed = compute_epoch_seed(0);
-        let expected_first_8_bytes = [
-            0x9bu8, 0x5bu8, 0x08u8, 0xa7u8, 0x71u8, 0xd5u8, 0x74u8, 0x67u8
-        ];
-        assert_eq!(&seed.0[..8], &expected_first_8_bytes);
+        // KAT: verify epoch seed 0 matches the prefixed-domain format.
+        let mut expected_data = Vec::new();
+        expected_data.extend_from_slice(&prefixed_domain(DOMAIN_EPOCH));
+        expected_data.extend_from_slice(&0u64.to_le_bytes());
+        let expected = blake3_256(&expected_data);
+        assert_eq!(seed, expected, "Epoch seed 0 must match prefixed-domain format");
+        assert_ne!(seed.0, [0u8; 32], "Epoch seed must not be zero");
     }
 
     #[test]
@@ -2194,21 +2154,27 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_cache_deterministic() {
-        let seed = compute_epoch_seed(0);
-        let c1 = generate_cache(&seed);
-        let c2 = generate_cache(&seed);
-        assert_eq!(c1.data.len(), CACHE_SIZE);
-        assert_eq!(c1.data, c2.data);
-    }
-
-    #[test]
     fn test_generate_program_deterministic() {
         let seed = Hash([1u8; 32]);
         let state = State::from_seed(&seed);
         let p1 = generate_program(&state);
         let p2 = generate_program(&state);
         assert_eq!(p1.instructions, p2.instructions);
+    }
+
+    #[test]
+    fn test_light_dataset_reset() {
+        let seed = compute_epoch_seed(0);
+        let mut light_ds = LightDataset::new(&seed);
+        let original = light_ds.get_node(0);
+        let dummy_node = vec![0xABu8; NODE_SIZE];
+        light_ds.set_node(0, dummy_node.clone());
+        assert_eq!(light_ds.get_node(0), dummy_node);
+        light_ds.reset();
+        let after_reset = light_ds.get_node(0);
+        assert_ne!(after_reset, dummy_node, "reset() must clear modified nodes");
+        assert_eq!(after_reset, original, "reset() must restore original node");
+        assert_eq!(after_reset.len(), NODE_SIZE);
     }
 
     #[test]

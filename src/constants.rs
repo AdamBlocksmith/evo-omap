@@ -18,9 +18,6 @@ pub const NODE_SIZE: usize = 1_048_576;
 /// Number of nodes in the dataset (256 nodes = 256 MiB total).
 pub const NUM_NODES: usize = 256;
 
-/// Cache size for light verification (32 MiB).
-pub const CACHE_SIZE: usize = 33_554_432;
-
 /// Number of compute steps per hash (controls memory access depth).
 pub const NUM_STEPS: usize = 4_096;
 
@@ -29,7 +26,7 @@ pub const NUM_STEPS: usize = 4_096;
 // =============================================================================
 
 /// Number of instructions per program.
-pub const PROGRAM_LENGTH: usize = 8;
+pub const PROGRAM_LENGTH: usize = 64;
 
 // =============================================================================
 // Epoch Parameters
@@ -62,18 +59,8 @@ pub const BRANCH_MASK: u64 = (BRANCH_WAYS - 1) as u64;
 /// Number of bytes of node data mixed into branch input (32 bytes).
 pub const BRANCH_NODE_PREFIX: usize = 32;
 
-/// Number of bytes of node data used in write operation (8 KiB).
-pub const WRITE_NODE_PREFIX: usize = 8_192;
+/// Number of bytes of node data used in write operation (128 KiB).
+pub const WRITE_NODE_PREFIX: usize = 131_072;
 
 /// Number of bytes of state mixed in various operations (32 bytes = 256 bits).
 pub const STATE_HASH_PREFIX: usize = 32;
-
-// =============================================================================
-// Cache Parameters
-// =============================================================================
-
-/// Cache block size in bytes (64 KiB).
-pub const CACHE_BLOCK_SIZE: usize = 65_536;
-
-/// Number of cache blocks (512 blocks × 64 KiB = 32 MiB).
-pub const CACHE_NUM_BLOCKS: usize = 512;

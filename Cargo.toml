@@ -3,7 +3,7 @@ name = "evo-omap"
 version = "0.1.0"
 edition = "2024"
 authors = ["EVO-OMAP Contributors"]
-description = "EVO-OMAP: Execution-based, memory-hard proof-of-work algorithm"
+description = "EVO-OMAP: Evolving Oriented Memory-hard Algorithm for Proof-of-work"
 
 [dependencies]
 blake3 = "1.8"

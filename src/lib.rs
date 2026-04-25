@@ -6,15 +6,15 @@ pub mod evo_omap;
 pub use hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 
 pub use evo_omap::{
-    State, Instruction, Program, Dataset, Cache, CowDataset,
+    State, Instruction, Program, Dataset, CowDataset,
     compute_epoch_seed,
     evo_omap_hash, evo_omap_hash_with_buffers, evo_omap_hash_light,
     LightDataset,
     mine, mine_parallel, verify, verify_light,
     derive_indices, execute_program, apply_branch, apply_branch_with_buffer, generate_program,
-    compute_memory_commitment, generate_dataset, generate_cache,
+    compute_memory_commitment, generate_dataset,
     DatasetCache, HashBuffers,
-    DatasetSpec, CacheSpec,
+    DatasetSpec,
     STATE_SIZE_SPEC,
     PROGRAM_LENGTH_MIN, PROGRAM_LENGTH_MAX,
     BRANCH_WAYS_MIN, BRANCH_WAYS_MAX,
