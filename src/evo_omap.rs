@@ -22,7 +22,7 @@ use crate::constants::{
     CACHE_BLOCK_SIZE, CACHE_NUM_BLOCKS,
     BRANCH_MASK, SRC_MASK,
     BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
-    NUM_REGISTERS,
+    NUM_REGISTERS, OPERAND_WORDS,
 };
 
 pub use crate::public_spec::DatasetSpec;
@@ -421,20 +421,54 @@ pub fn generate_program(state: &State) -> Program {
     Program { instructions }
 }
 
+fn fill_program_buffer(words: &[u64; 8], buf: &mut Vec<Instruction>) {
+    buf.clear();
+    for i in 0..PROGRAM_LENGTH {
+        let word_idx = i % NUM_REGISTERS;
+        let bit_offset = (i % 8) * 8;
+        let selector = words[word_idx];
+        let op_bits = (selector >> bit_offset) & 0x07;
+        let dst = ((selector >> (bit_offset + 3)) & 0x07) as u8;
+        let src = ((selector >> (bit_offset + 6)) & SRC_MASK) as u8;
+        let instruction = match op_bits {
+            0 => Instruction::Add { dst, src },
+            1 => Instruction::Sub { dst, src },
+            2 => Instruction::Mul { dst, src },
+            3 => Instruction::Xor { dst, src },
+            4 => Instruction::Rotl { dst, src },
+            5 => Instruction::Rotr { dst, src },
+            6 => Instruction::Mulh { dst, src },
+            7 => Instruction::Swap { a: dst, b: src },
+            _ => unreachable!(),
+        };
+        buf.push(instruction);
+    }
+}
+
+fn execute_instructions(state: &mut State, instructions: &[Instruction], node1: &[u8], node2: &[u8]) {
+    let node1_words = node_as_u64_array(node1);
+    let node2_words = node_as_u64_array(node2);
+    let mut state_arr = state.as_u64_array();
+    for instruction in instructions {
+        instruction.execute(&mut state_arr, &node1_words, &node2_words);
+    }
+    state.write_all_u64(&state_arr);
+}
+
 pub fn derive_indices(state: &State, step: u64) -> (usize, usize, usize) {
     let words = state.as_u64_array();
+    derive_indices_from_words(&words, step)
+}
+
+fn derive_indices_from_words(words: &[u64; 8], step: u64) -> (usize, usize, usize) {
     let idx1 = (words[0].wrapping_add(step) % NUM_NODES as u64) as usize;
     let idx2 = (words[1].wrapping_mul(step.wrapping_add(1)) % NUM_NODES as u64) as usize;
     let idx_write = ((words[2] ^ words[3]) % NUM_NODES as u64) as usize;
     (idx1, idx2, idx_write)
 }
 
-fn node_word_count() -> usize {
-    NODE_SIZE / 8
-}
-
 fn node_as_u64_array(node: &[u8]) -> Vec<u64> {
-    let word_count = node_word_count();
+    let word_count = OPERAND_WORDS;
     let mut words = Vec::with_capacity(word_count);
     for i in 0..word_count {
         let bytes = &node[i * 8..i * 8 + 8];
@@ -612,6 +646,9 @@ pub struct HashBuffers {
     pub branch_input: Vec<u8>,
     pub commitment_input: Vec<u8>,
     pub final_input: Vec<u8>,
+    pub program_buf: Vec<Instruction>,
+    pub node1_prefix: Vec<u8>,
+    pub node2_prefix: Vec<u8>,
 }
 
 impl HashBuffers {
@@ -622,6 +659,9 @@ impl HashBuffers {
             branch_input: Vec::with_capacity(16 + 32 + 64 + 32 + 32),
             commitment_input: Vec::with_capacity(32 + 8 + 32),
             final_input: Vec::with_capacity(32 + 32 + 32),
+            program_buf: Vec::with_capacity(PROGRAM_LENGTH),
+            node1_prefix: Vec::with_capacity(WRITE_NODE_PREFIX),
+            node2_prefix: Vec::with_capacity(WRITE_NODE_PREFIX),
         }
     }
 
@@ -631,6 +671,9 @@ impl HashBuffers {
         self.branch_input.clear();
         self.commitment_input.clear();
         self.final_input.clear();
+        self.program_buf.clear();
+        self.node1_prefix.clear();
+        self.node2_prefix.clear();
     }
 }
 
@@ -656,20 +699,31 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
     let mut commitment_hash = blake3_256(&buffers.commitment_data);
 
     for step in 0..NUM_STEPS {
-        let program = generate_program(&state);
-        let (idx1, idx2, idx_write) = derive_indices(&state, step as u64);
+        let state_words = state.as_u64_array();
+        fill_program_buffer(&state_words, &mut buffers.program_buf);
+        let (idx1, idx2, idx_write) = derive_indices_from_words(&state_words, step as u64);
 
-        let node1 = dataset.get(idx1).to_vec();
-        let node2 = dataset.get(idx2).to_vec();
+        // Copy only the prefix bytes actually consumed (8 KiB vs 1 MiB).
+        // Scoped blocks drop the dataset borrows before dataset.set() below.
+        {
+            let s = dataset.get(idx1);
+            buffers.node1_prefix.clear();
+            buffers.node1_prefix.extend_from_slice(&s[..WRITE_NODE_PREFIX]);
+        }
+        {
+            let s = dataset.get(idx2);
+            buffers.node2_prefix.clear();
+            buffers.node2_prefix.extend_from_slice(&s[..WRITE_NODE_PREFIX]);
+        }
 
-        execute_program(&mut state, &program, &node1, &node2);
+        execute_instructions(&mut state, &buffers.program_buf, &buffers.node1_prefix, &buffers.node2_prefix);
 
-        apply_branch_with_buffer(&mut state, step as u32, &node1, &node2, &mut buffers.branch_input);
+        apply_branch_with_buffer(&mut state, step as u32, &buffers.node1_prefix, &buffers.node2_prefix, &mut buffers.branch_input);
 
         let state_bytes = state.as_bytes();
         buffers.write_data.clear();
-        buffers.write_data.extend_from_slice(&node1[..WRITE_NODE_PREFIX]);
-        buffers.write_data.extend_from_slice(&node2[..WRITE_NODE_PREFIX]);
+        buffers.write_data.extend_from_slice(&buffers.node1_prefix);
+        buffers.write_data.extend_from_slice(&buffers.node2_prefix);
         buffers.write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
         let written = blake3_xof(&buffers.write_data, NODE_SIZE);
         dataset.set(idx_write, written);
@@ -699,8 +753,8 @@ pub fn apply_branch_with_buffer(
     node2: &[u8],
     input: &mut Vec<u8>,
 ) {
-    let words = state.as_u64_array();
-    let branch_variant = (words[0] & BRANCH_MASK) as u8;
+    let mut state_arr = state.as_u64_array();
+    let branch_variant = (state_arr[0] & BRANCH_MASK) as u8;
     let state_bytes = state.as_bytes();
 
     input.clear();
@@ -732,7 +786,6 @@ pub fn apply_branch_with_buffer(
     }
 
     let output = blake3_xof(input, STATE_SIZE_SPEC);
-    let mut state_arr = state.as_u64_array();
     for i in 0..NUM_REGISTERS {
         let xor_val = u64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
         state_arr[i] ^= xor_val;

@@ -21,3 +21,8 @@ path = "src/main.rs"
 [lib]
 name = "evo_omap"
 path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

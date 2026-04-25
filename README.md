@@ -178,18 +178,18 @@ where every input to SHA3-256 was computed with Blake3. Using SHA3-256 (Keccak s
 
 Difficulty `D` requires the 32-byte SHA3-256 final hash to have **at least D consecutive leading zero bits**. Expected attempts = **2^D**.
 
-| Difficulty | Expected attempts | Acceptance rate | Block time @ 0.13 H/s | Block time @ 0.15 H/s |
-|-----------|------------------|-----------------|----------------------|----------------------|
-| 1 | 2 | ~50% | ~15 s | ~13 s |
-| 4 | 16 | ~6.25% | ~2 min | ~1.8 min |
-| 5 | 32 | ~3.1% | ~4 min | ~3.6 min |
-| 8 | 256 | ~0.39% | ~33 min | ~28 min |
-| 10 | 1,024 | ~0.098% | ~2.2 hr | ~1.9 hr |
-| 16 | 65,536 | ~0.0015% | ~140 hr | ~121 hr |
+> **Note:** EVO-OMAP is a standalone PoW library — it accepts `difficulty` as an input parameter and returns a hash. Block time targets are **not** configured in this library; they belong in the blockchain code that calls evo-omap and adjusts `difficulty` to hit its desired block interval. The timing estimates below are for documentation reference only.
 
-**Recommended starting difficulty: 4** for ~120-second block times.
-- At 0.13 H/s (Windows Intel): 2⁴ × 7.5 s = ~120 s per block
-- At 0.15 H/s (Mac M1): 2⁴ × 6.5 s = ~104 s per block
+| Difficulty | Expected attempts | Acceptance rate | Example block time @ 0.13 H/s (Windows Intel) | Example block time @ 0.19 H/s (M1, optimized) |
+|-----------|------------------|-----------------|------------------------------------------------|------------------------------------------------|
+| 1 | 2 | ~50% | ~15 s | ~11 s |
+| 4 | 16 | ~6.25% | ~2 min | ~84 s |
+| 5 | 32 | ~3.1% | ~4 min | ~2.8 min |
+| 8 | 256 | ~0.39% | ~33 min | ~22 min |
+| 10 | 1,024 | ~0.098% | ~2.2 hr | ~1.5 hr |
+| 16 | 65,536 | ~0.0015% | ~140 hr | ~96 hr |
+
+**Example:** a blockchain targeting 120-second blocks would set difficulty 4 when miners are running at ~0.13 H/s (Windows Intel), or difficulty 4 for ~84-second blocks at 0.19 H/s (M1 optimized). The `difficulty` parameter your blockchain passes to `mine()` controls this — evo-omap itself has no block-time concept.
 
 > **Important:** Always set `max_nonce` well above 2^difficulty. If `max_nonce < 2^difficulty` no nonce will be found. For difficulty 10: expected ~1,024 attempts × 7.5 s = ~2 hours. The CLI warns you if `max_nonce` is too low.
 
@@ -354,10 +354,10 @@ Performance optimizations for production mining:
 
 **Measured single-threaded performance (release build):**
 
-| Platform | Per-hash | Hashrate | Difficulty 1 | Difficulty 5 |
-|----------|----------|----------|--------------|--------------|
-| Windows Intel (desktop) | ~7.5 s | ~0.13 H/s | 15 s, nonce 1, 2 attempts | 335 s, nonce 44, 45 attempts |
-| Mac M1 (Apple Silicon) | ~6.5 s | ~0.15 H/s | 14 s, nonce 1, 2 attempts | 294 s, nonce 44, 45 attempts |
+| Platform | Per-hash | Hashrate | Notes |
+|----------|----------|----------|-------|
+| Windows Intel (desktop) | ~7.5 s | ~0.13 H/s | Pre-optimization baseline; not yet re-benchmarked after node-clone elimination |
+| Mac M1 (Apple Silicon) | ~5.3 s | ~0.19 H/s | After node-clone elimination (1 MiB → 16 KiB memcpy per step, +27% vs 0.15 H/s baseline) |
 
 Dataset generation is ~500 ms – 8 s depending on memory bandwidth (paid once per epoch).
 
