@@ -159,6 +159,26 @@ memory_commitment = H(DOMAIN_MEMORY ‖ Node[0] ‖ ... ‖ Node[N-1])
 final_hash = SHA3-256(state_summary ‖ commitment_hash ‖ memory_commitment)
 ```
 
+### Difficulty
+
+Difficulty is defined as the **minimum number of consecutive leading zero bits** in the 32-byte SHA3-256 final hash. A nonce is valid when:
+
+```
+count_leading_zero_bits(final_hash) >= difficulty
+```
+
+| Difficulty | Required leading zero bits | Acceptance rate | Expected attempts |
+|-----------|---------------------------|-----------------|------------------|
+| 1 | ≥ 1 | ~50% | ~2 |
+| 8 | ≥ 8 | ~0.39% | ~256 |
+| 16 | ≥ 16 | ~0.0015% | ~65,536 |
+| 24 | ≥ 24 | ~5.96 × 10⁻⁶% | ~16,777,216 |
+| 32 | ≥ 32 | ~2.33 × 10⁻⁸% | ~4,294,967,296 |
+
+Each additional difficulty bit halves the acceptance rate. This is equivalent to Bitcoin's leading-zero target, but measured in individual bits rather than nibbles.
+
+> **Note:** Prior to commit `e37129f`, difficulty was computed as `hash_int < u64::MAX / difficulty` — comparing only the first 8 bytes of the hash as a u64. That formula did not correctly represent mining difficulty and made `verify()` accept nearly any nonce at low difficulty values. The leading-zero-bit check above is the correct implementation.
+
 ## Memory-Hardness Analysis
 
 ### Why 256 MiB?
@@ -225,7 +245,9 @@ Light verification reconstructs nodes on-demand by walking the dataset node chai
 - Trades computation for memory
 - Must recompute nodes that the full verification would have modified
 
-The `LightDataset` implementation caches original nodes lazily and tracks mutations, ensuring the memory commitment computation includes the same node state as full verification.
+The `LightDataset` implementation caches original nodes lazily and tracks mutations. Original nodes are always reconstructed through the **unmodified** predecessor chain (via `get_original_chain_node()`), regardless of which nodes were written during hashing. This matches the behaviour of the full `Dataset`, where unmodified nodes retain their pre-generated values even after their predecessor is overwritten.
+
+**Full and light verification are guaranteed to produce identical hashes for the same inputs.** (A bug where `LightDataset` used modified predecessors during reconstruction, causing hash divergence, was fixed in commit `e37129f`.)
 
 ## Reference Implementation
 
@@ -255,6 +277,7 @@ use evo_omap::{
 let nonce = mine(header, height, difficulty, max_attempts);
 
 // Multi-threaded mining (uses rayon, auto-detects CPU cores)
+// WARNING: mine_parallel() still uses the old difficulty check — do not use in production
 let nonce = mine_parallel(header, height, difficulty, max_attempts, num_threads);
 
 // Full verification (requires 256 MiB)
@@ -313,15 +336,23 @@ Performance optimizations for production mining:
 | Dataset caching | `DatasetCache` reuses dataset within same epoch, regenerating only on epoch boundary |
 | Shared dataset | `Arc<Dataset>` allows read-only sharing across threads without cloning |
 
-**Typical performance (Ryzen 7 7700, release build):**
-- Dataset generation: ~7.5s (once per epoch)
-- Per-hash (single-threaded): ~4.7s
+**Typical performance (release build, varies significantly by hardware):**
+- Dataset generation: ~500 ms – 8 s (once per epoch, depends on memory bandwidth)
+- Per-hash (single-threaded): ~4 s – 8 s
 - Parallel mining: ~6-7x throughput on 8-core CPU
 
+Run the built-in benchmark to measure on your hardware:
+```bash
+# 5 iterations of dataset gen, per-hash, light verify, and full verify
+./target/release/evo-omap bench 00 0 1 5
+```
+
 **Production recommendations:**
-- Use `mine_parallel` for batch nonce search
+- Use `mine()` (single-threaded) for correct difficulty enforcement
 - Use `DatasetCache` to avoid regenerating dataset within same epoch
 - Use `HashBuffers` for batch hash computation
+
+> **Known issue:** `mine_parallel()` in `evo_omap.rs` still uses the old `hash_int < u64::MAX / difficulty` difficulty check (not fixed in `e37129f`). Use `mine()` for correctness; `mine_parallel()` accepts nonces that do not meet the leading-zero requirement.
 
 ## Comparison with Other PoWs
 
@@ -347,11 +378,27 @@ However, SRAM at 256 MiB requires significant die area, limiting other optimizat
 
 ### 2. Light Client Trust
 
-Light clients verify using cache-based node reconstruction. The commitment scheme (linear hash, not Merkle tree) means light clients cannot verify node inclusion efficiently. Future work: implement proper Merkle tree for O(log n) proofs.
+Light clients verify using on-demand node reconstruction (`LightDataset`). `verify()` and `verify_light()` are guaranteed to agree: both compute the same final SHA3-256 hash for any given `(header, height, nonce)` tuple. The commitment scheme uses a linear hash (not a Merkle tree), so light clients cannot verify individual node inclusion without recomputing the full chain. Future work: implement a Merkle tree for O(log n) membership proofs.
 
 ### 3. Big-Endian Platforms
 
 The algorithm uses little-endian byte interpretation for arithmetic. Big-endian platforms would produce different hashes, causing chain splits. This is explicitly **not supported**.
+
+### 4. Security Fixes (commit `e37129f`)
+
+Three critical bugs were fixed in commit `e37129f`. All affected the difficulty check and verification logic:
+
+**Bug 1 — Broken difficulty target in `mine()`**
+The single-threaded miner used `target = u64::MAX / difficulty` and checked `hash_int < target`. At `difficulty = 1` this accepted every hash unconditionally; at higher difficulties the formula did not match the intended leading-zero semantics. Fixed by replacing with a leading-zero-bit count over all 32 hash bytes.
+
+**Bug 2 — `verify()` accepted arbitrary nonces**
+`verify()` used the same `u64::MAX / difficulty` formula, so it returned `true` for nearly any nonce at low difficulty. Fixed with the same leading-zero-bit check.
+
+**Bug 3 — `verify_light()` produced different hashes than `verify()`**
+`LightDataset::get_node()` reconstructed unmodified nodes using `get_node(index - 1)` as the predecessor, which could return a node that had been overwritten by a prior write step. This caused the reconstructed "original" node to differ from the pre-generated value in the full dataset, producing a different memory commitment and a different final hash. Fixed by introducing `get_original_chain_node()`, which always recurses through the unmodified original chain.
+
+**Remaining issue — `mine_parallel()` not yet fixed**
+`mine_parallel()` in `evo_omap.rs` still uses the old `hash_int < u64::MAX / difficulty` check. Parallel mining should not be used in production until this is patched.
 
 ## Test Vectors
 
