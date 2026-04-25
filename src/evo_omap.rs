@@ -741,9 +741,9 @@ pub fn mine(
     height: u64,
     difficulty: u64,
     max_nonce_attempts: u64,
-) -> Option<u64> {
+) -> (Option<u64>, u64) {
     if difficulty == 0 {
-        return None;
+        return (None, 0);
     }
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = generate_dataset(&epoch_seed);
@@ -751,19 +751,21 @@ pub fn mine(
 
     let mut cow_dataset = CowDataset::new(&base_dataset);
     let mut buffers = HashBuffers::new();
+    let mut attempts = 0u64;
 
     for nonce in 0..max_nonce_attempts {
         cow_dataset.reset();
+        attempts += 1;
 
         let pow_hash = evo_omap_hash_with_buffers(&mut cow_dataset, header, height, nonce, &mut buffers);
 
         let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
         if hash_int < target {
-            return Some(nonce);
+            return (Some(nonce), attempts);
         }
     }
 
-    None
+    (None, attempts)
 }
 
 use rayon::prelude::*;
@@ -774,9 +776,9 @@ pub fn mine_parallel(
     difficulty: u64,
     max_nonce_attempts: u64,
     num_threads: usize,
-) -> Option<u64> {
+) -> (Option<u64>, u64) {
     if difficulty == 0 {
-        return None;
+        return (None, 0);
     }
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = Arc::new(generate_dataset(&epoch_seed));
@@ -789,24 +791,29 @@ pub fn mine_parallel(
         .map(|chunk| (*chunk.first().unwrap(), *chunk.last().unwrap() + 1))
         .collect();
 
-    chunks
+    let result = chunks
         .into_par_iter()
         .find_map_any(|(start_nonce, end_nonce)| {
             let mut buffers = HashBuffers::new();
             let mut dataset = CowDataset::new(&base_dataset);
+            let mut attempts = 0u64;
 
             for nonce in start_nonce..end_nonce {
                 dataset.reset();
+                attempts += 1;
 
                 let pow_hash = evo_omap_hash_with_buffers(&mut dataset, &header, height, nonce, &mut buffers);
 
                 let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
                 if hash_int < target {
-                    return Some(nonce);
+                    return Some((Some(nonce), attempts));
                 }
             }
-            None
-        })
+            Some((None, attempts))
+        });
+
+    let (nonce, total_attempts) = result.unwrap_or((None, 0));
+    (nonce, total_attempts)
 }
 
 pub struct DatasetCache {

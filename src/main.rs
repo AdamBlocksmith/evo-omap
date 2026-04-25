@@ -78,13 +78,8 @@ fn main() {
             }
             println!();
 
-            let start = Instant::now();
-            let _epoch_seed = compute_epoch_seed(height);
-            let ds_gen_time = start.elapsed();
-            println!("Dataset generation: {:.3}s", ds_gen_time.as_secs_f64());
-
             let mine_start = Instant::now();
-            let result = if parallel {
+            let (result, attempts) = if parallel {
                 mine_parallel(&header, height, difficulty, max_nonce, num_threads)
             } else {
                 mine(&header, height, difficulty, max_nonce)
@@ -97,10 +92,11 @@ fn main() {
                 Some(nonce) => {
                     println!("Found valid nonce: {}", nonce);
                     println!("Nonce (hex): 0x{:x}", nonce);
-                    println!("Hashrate: {:.2} H/s", max_nonce as f64 / mine_time.as_secs_f64());
+                    println!("Hash attempts: {}", attempts);
+                    println!("Hashrate: {:.2} H/s", attempts as f64 / mine_time.as_secs_f64());
                 }
                 None => {
-                    println!("No valid nonce found in {} attempts.", max_nonce);
+                    println!("No valid nonce found in {} attempts.", attempts);
                     process::exit(1);
                 }
             }
