@@ -371,12 +371,15 @@ pub fn generate_program(state: &State) -> Program {
 
     for i in 0..PROGRAM_LENGTH {
         let word_idx = i % NUM_REGISTERS;
-        let bit_offset = (i % 8) * 8;
-        let selector = words[word_idx];
+        // Mix a position-dependent constant into the word so that slots sharing
+        // the same word_idx (e.g. i=0 and i=8) produce distinct selectors.
+        // The constant is the 64-bit golden-ratio multiplier (Knuth, TAOCP).
+        let selector = words[word_idx]
+            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
 
-        let op_bits = (selector >> bit_offset) & 0x07;
-        let dst = ((selector >> (bit_offset + 3)) & 0x07) as u8;
-        let src = ((selector >> (bit_offset + 6)) & SRC_MASK) as u8;
+        let op_bits = selector & 0x07;
+        let dst = ((selector >> 3) & 0x07) as u8;
+        let src = ((selector >> 6) & SRC_MASK) as u8;
 
         let instruction = match op_bits {
             0 => Instruction::Add { dst, src },
@@ -399,11 +402,11 @@ fn fill_program_buffer(words: &[u64; 8], buf: &mut Vec<Instruction>) {
     buf.clear();
     for i in 0..PROGRAM_LENGTH {
         let word_idx = i % NUM_REGISTERS;
-        let bit_offset = (i % 8) * 8;
-        let selector = words[word_idx];
-        let op_bits = (selector >> bit_offset) & 0x07;
-        let dst = ((selector >> (bit_offset + 3)) & 0x07) as u8;
-        let src = ((selector >> (bit_offset + 6)) & SRC_MASK) as u8;
+        let selector = words[word_idx]
+            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let op_bits = selector & 0x07;
+        let dst = ((selector >> 3) & 0x07) as u8;
+        let src = ((selector >> 6) & SRC_MASK) as u8;
         let instruction = match op_bits {
             0 => Instruction::Add { dst, src },
             1 => Instruction::Sub { dst, src },
@@ -1779,7 +1782,6 @@ mod tests {
         let header = b"valid proof test";
         let height = 1000u64;
         let difficulty = 1u64;
-        let target = u64::MAX / difficulty;
 
         let seed = compute_epoch_seed(height);
         let base_ds = generate_dataset(&seed);
@@ -1791,8 +1793,11 @@ mod tests {
                 ds.set(i, base_ds.get(i).to_vec());
             }
             let hash = evo_omap_hash(&mut ds, header, height, nonce);
-            let hash_int = u64::from_be_bytes(hash.0[..8].try_into().unwrap());
-            if hash_int < target {
+            let leading_zeros = hash.0.iter()
+                .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+                .take_while(|&b| b == 0)
+                .count() as u64;
+            if leading_zeros >= difficulty {
                 found_nonce = Some(nonce);
                 break;
             }

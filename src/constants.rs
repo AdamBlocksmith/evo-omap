@@ -26,7 +26,7 @@ pub const NUM_STEPS: usize = 4_096;
 // =============================================================================
 
 /// Number of instructions per program.
-pub const PROGRAM_LENGTH: usize = 64;
+pub const PROGRAM_LENGTH: usize = 16;
 
 // =============================================================================
 // Epoch Parameters
