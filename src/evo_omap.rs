@@ -801,6 +801,11 @@ pub fn mine_parallel(
     if difficulty == 0 {
         return (None, 0);
     }
+    let num_threads = if num_threads == 0 {
+        rayon::current_num_threads()
+    } else {
+        num_threads
+    };
     let epoch_seed = compute_epoch_seed(height);
     let base_dataset = Arc::new(generate_dataset(&epoch_seed));
     let header = Arc::new(header.to_vec());
