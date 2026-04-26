@@ -347,6 +347,67 @@ cargo run -- bench <header_hex> <height> <difficulty> [iterations]
 cargo run -- seed <height>
 ```
 
+## Integration Guide
+
+### Minimal blockchain integration
+
+```rust
+use evo_omap::{mine_parallel, verify, compute_epoch_seed, 
+               generate_dataset, current_num_threads};
+
+// Mining a new block
+fn mine_block(header: &[u8], height: u64, difficulty: u64) 
+    -> Option<u64> {
+    let max_attempts = 1 << (difficulty + 4); // 16x expected attempts
+    let threads = current_num_threads();
+    let (nonce, _) = mine_parallel(
+        header, height, difficulty, max_attempts, threads
+    );
+    nonce
+}
+
+// Validating an incoming block
+fn validate_block(header: &[u8], height: u64, 
+                  nonce: u64, difficulty: u64) -> bool {
+    verify(header, height, nonce, difficulty)
+}
+```
+
+### Difficulty adjustment
+EVO-OMAP accepts difficulty as an input — your blockchain code is 
+responsible for adjusting it. A simple adjustment algorithm:
+
+```rust
+fn adjust_difficulty(current_difficulty: u64, 
+                     actual_block_time_secs: f64,
+                     target_block_time_secs: f64) -> u64 {
+    // If blocks are coming 2x too fast, increase difficulty by 1 bit
+    // If blocks are coming 2x too slow, decrease difficulty by 1 bit
+    if actual_block_time_secs < target_block_time_secs / 2.0 {
+        current_difficulty + 1
+    } else if actual_block_time_secs > target_block_time_secs * 2.0 {
+        current_difficulty.saturating_sub(1)
+    } else {
+        current_difficulty
+    }
+}
+```
+
+### Epoch boundary handling
+The dataset regenerates every 1024 blocks (~34 hours at 120s blocks).
+Use DatasetCache to avoid regenerating on every block:
+
+```rust
+let mut cache = DatasetCache::new();
+// cache.get_dataset() only regenerates when height crosses 
+// an epoch boundary
+let dataset = cache.get_dataset(height);
+```
+
+### Recommended starting difficulty
+Start at difficulty 4 (16 expected attempts) for a single-miner 
+testnet. Increase as more miners join.
+
 ## Performance
 
 Performance optimizations for production mining:
@@ -435,6 +496,33 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 | 3.4 | `LightDataset::reset()` + call in `verify_light` | Prevents state leakage between verifications |
 | 2.2 | Read indices mix `words[4]`/`words[5]` | Improves index unpredictability |
 
+## Known Limitations
+
+### Epoch Seed Precomputation
+Epoch seeds are deterministic functions of epoch number only. A 
+well-resourced attacker can precompute datasets for future epochs 
+in advance. Mitigation: bind epoch seed to parent block hash in 
+the blockchain layer — e.g. epoch_seed = H(parent_hash || epoch).
+This cannot be fixed in the evo-omap library alone as it requires 
+chain state.
+
+### Light Client Merkle Proofs
+The memory commitment uses a linear hash over all 256 nodes. Light 
+clients cannot verify individual node inclusion without recomputing 
+the full commitment chain. Future work: replace with a Merkle tree 
+for O(log n) membership proofs.
+
+### Network Security at Launch
+At current hashrates (~0.16-1.48 H/s per machine), a single 
+additional machine can match a small honest network. Real economic 
+security requires a sufficiently large and distributed mining 
+network. Difficulty should be set conservatively at launch.
+
+### Big-Endian Platforms
+Not supported. The algorithm uses little-endian byte interpretation.
+Big-endian platforms produce different hashes and would cause chain 
+splits.
+
 ## Test Vectors
 
 Test vectors are computed dynamically in the test module (`evo_omap.rs`). Run tests with `cargo test` to verify correctness against known-answer tests (87 tests, 0 failures).
@@ -459,6 +547,38 @@ Key innovations:
 - Mutable dataset with read-write dependence
 - All instructions access memory (not just mining seed)
 - 4-way branching with variable node data mixing
+
+## Changelog
+
+### v0.1.0 (current)
+- Initial implementation of EVO-OMAP algorithm
+- Critical security fix (commit e37129f): broken difficulty target,
+  verify() accepting arbitrary nonces, verify_light() hash divergence
+- 12 further security fixes from full audit (see Security Fixes table)
+- Performance optimizations: +27% hashrate on M1, +115% on Windows
+  Intel via node clone elimination and operand array truncation
+- Parallel mining via atomic work-stealing nonce counter
+- 87 tests passing, 0 failures
+
+### API Stability
+This is v0.1 — the API is not yet stable. Breaking changes may occur
+before v1.0. Pin to a specific commit hash if building production 
+systems on top of this library.
+
+## Contributing
+
+### Running tests
+cargo test --release         # full suite (~12 minutes)
+cargo test --release -- --ignored   # should return 0 ignored
+
+### Running benchmarks
+./target/release/evo-omap mine 00 0 4 10000 --parallel
+
+### Submitting changes
+- All 87 tests must pass before submitting a PR
+- Protocol changes (constants, hash construction, domain separators)
+  are breaking changes and require a version bump
+- Performance changes must include before/after hashrate numbers
 
 ## License
 
