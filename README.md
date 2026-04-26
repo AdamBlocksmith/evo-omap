@@ -2,14 +2,14 @@
 
 ## Overview
 
-EVO-OMAP (Evolving Oriented Memory-hard Algorithm for Proof-of-work) is a memory-hard proof-of-work algorithm designed to achieve equitable hashrate distribution across CPU, GPU, and ASIC hardware. Unlike hash-based PoWs (SHA-256, Scrypt), EVO-OMAP is **execution-based** — miners must execute a deterministic program that reads and writes a large memory buffer, forcing specialized hardware to include large SRAM.
+EVO-OMAP (Evolving Oriented Memory-hard Algorithm for Proof-of-work) is a memory-hard proof-of-work algorithm designed to achieve equitable hashrate distribution across CPU, GPU, and ASIC hardware. Unlike hash-based PoWs (SHA-256, Scrypt), EVO-OMAP is **execution-based** — miners must execute a deterministic program that reads and writes a large memory buffer, forcing high DRAM bandwidth requirements on all mining hardware.
 
 ## Key Properties
 
 | Property | Value | Implication |
 |----------|-------|-------------|
-| Memory Footprint | 256 MiB | ASICs require expensive on-chip SRAM |
-| Memory Access | Read-write per step | Cannot be computed with DRAM alone |
+| Memory Footprint | 256 MiB | Requires 256 MiB DRAM bandwidth |
+| Memory Access | Read-write per step | Random read-write pattern saturates DRAM bandwidth |
 | Branch Factor | 4-way | GPU warp efficiency reduced; CPUs with branch prediction excel |
 | Execution Model | Superscalar | 64 instructions per step with data-dependent operands |
 | State Size | 512 bits | Small enough for full in-register execution |
@@ -30,7 +30,7 @@ Traditional hash-based PoWs (SHA-256, Scrypt, Argon2) compute a pure function �
 EVO-OMAP requires a **mutable 256 MiB dataset** that changes with every nonce attempt. The algorithm:
 
 1. Reads two nodes from the dataset each step
-2. Executes 8 instructions using data from those nodes as operands
+2. Executes 64 instructions using data from those nodes as operands
 3. Applies a 4-way data-dependent branch
 4. Writes one node back to the dataset
 
@@ -125,14 +125,12 @@ At each of `T = 4096` steps:
    SWAP:  swap(w[a], w[b])
    ```
 
-4. **Branch Application**: Select branch variant and mix. All 4 variants consume both nodes exactly once:
+4. **Branch Application**: Select branch variant and mix. All 4 variants consume both nodes. The variant byte is included in the hash input before the node bytes, so all four produce distinct XOF outputs even though variants 0&2 share the same node order and variants 1&3 share the same node order:
    ```
    variant = w₀ mod 4
-   input = prefixed(DOMAIN_BRANCH) ‖ step_u32_le ‖ variant_u8 ‖ state
-   - variant 0: state ‖ node1[0..32] ‖ node2[0..32]
-   - variant 1: state ‖ node2[0..32] ‖ node1[0..32]
-   - variant 2: state ‖ node1[0..32] ‖ node2[0..32]
-   - variant 3: state ‖ node2[0..32] ‖ node1[0..32]
+   input = prefixed(DOMAIN_BRANCH) ‖ step_u32_le ‖ variant_u8
+   variants 0, 2: input ‖= state ‖ node1[0..32] ‖ node2[0..32]
+   variants 1, 3: input ‖= state ‖ node2[0..32] ‖ node1[0..32]
    output = XOF(input, 64)
    for j = 0 to 7: wⱼ = wⱼ ⊕ output[j×8:(j+1)×8]
    ```
@@ -184,17 +182,18 @@ Difficulty `D` requires the 32-byte SHA3-256 final hash to have **at least D con
 
 Block times below are based on parallel hashrate since `--parallel` is recommended for mining.
 
-| Difficulty | Expected attempts | Acceptance rate | Block time @ 0.62 H/s (M1, 8 threads) |
-|-----------|------------------|-----------------|----------------------------------------|
-| 1 | 2 | ~50% | ~3 s |
-| 4 | 16 | ~6.25% | ~26 s |
-| 5 | 32 | ~3.1% | ~52 s |
-| 7 | 128 | ~0.78% | ~3.5 min |
-| 8 | 256 | ~0.39% | ~7 min |
-| 10 | 1,024 | ~0.098% | ~28 min |
-| 16 | 65,536 | ~0.0015% | ~29 hr |
+| Difficulty | Expected attempts | Acceptance rate | Block time @ 1.48 H/s (Ryzen 7 7700, 16 threads) | Block time @ 0.62 H/s (M1, 8 threads) |
+|-----------|------------------|-----------------|---------------------------------------------------|----------------------------------------|
+| 1 | 2 | ~50% | ~1 s | ~3 s |
+| 4 | 16 | ~6.25% | ~11 s | ~26 s |
+| 5 | 32 | ~3.1% | ~22 s | ~52 s |
+| 7 | 128 | ~0.78% | ~87 s | ~3.5 min |
+| 8 | 256 | ~0.39% | ~3 min | ~7 min |
+| 10 | 1,024 | ~0.098% | ~11.5 min | ~28 min |
+| 16 | 65,536 | ~0.0015% | ~12.3 hr | ~29 hr |
 
 **Recommended difficulty for ~120s blocks:**
+- Solo miner, Ryzen 7 7700 (`--parallel`, 16 threads): **difficulty 7–8**
 - Solo miner, Apple M1 (`--parallel`, 8 threads): **difficulty 5–6**
 - Multi-miner network: difficulty is set dynamically by the blockchain code based on observed block times — evo-omap accepts whatever value is passed in
 
@@ -210,9 +209,9 @@ The `difficulty` parameter your blockchain passes to `mine_parallel()` controls 
 
 The memory requirement serves two purposes:
 
-1. **Force SRAM usage**: 256 MiB of DRAM has ~100ns latency; SRAM at that capacity would cost >$1000 per chip. This makes single-chip ASIC mining economically infeasible.
+1. **Force DRAM bandwidth**: 256 MiB of DRAM must be accessed with large random read-write patterns across 4096 steps, each consuming 128 KiB per node read. This saturates memory bandwidth and cannot be avoided with caching.
 
-2. **Create memory bandwidth ceiling**: Sequential read-write of 256 MiB takes ~50μs at 5 GB/s bandwidth. The algorithm's 4096 steps each read 2 nodes and write 1, requiring significant memory bandwidth.
+2. **Create memory bandwidth ceiling**: Each step reads two 1 MiB nodes and writes one, processing 128 KiB of node data through Blake3. At 4096 steps this creates a sustained ~1 GiB/hash DRAM workload that bounds throughput by memory bandwidth, not compute.
 
 ### Why Operand Access?
 
@@ -238,12 +237,12 @@ Each node depends on the previous node via XOF. This means:
 
 | Factor | CPU | GPU | Potential ASIC |
 |--------|-----|-----|---------------|
-| Memory | DRAM (shared) | DRAM (shared) | SRAM (on-chip) |
-| Memory Cost | Low | Low | Very High |
+| Memory | DRAM (shared) | DRAM (shared) | DRAM (high bandwidth) |
+| Memory Cost | Low | Low | Moderate |
 | Memory Bandwidth | 50 GB/s | 500 GB/s | 1000 GB/s |
 | Branch Handling | Branch predictor | 32-thread warp divergence | Custom branch unit |
-| Area Efficiency | N/A | N/A | SRAM dominates die area |
-| Expected Advantage | 1x (baseline) | 0.5-2x | 2-5x (limited by SRAM) |
+| Area Efficiency | N/A | N/A | Memory controller dominates |
+| Expected Advantage | 1x (baseline) | 0.5-2x | 2-5x (limited by DRAM bandwidth) |
 
 The theoretical ASIC advantage is **bounded by memory**, not unbounded as with pure hash functions.
 
@@ -364,10 +363,12 @@ Performance optimizations for production mining:
 
 | Platform | Mode | Per-hash | Hashrate | Parallel speedup |
 |----------|------|----------|----------|-----------------|
+| Windows Ryzen 7 7700 (16 cores) | Single thread | ~3.6 s | ~0.28 H/s | — |
+| Windows Ryzen 7 7700 (16 cores) | `--parallel` 16 threads | — | ~1.48 H/s | ~5.3× |
 | Mac M1 (8 cores) | Single thread | ~6.1 s | ~0.16 H/s | — |
 | Mac M1 (8 cores) | `--parallel` 8 threads | — | ~0.62 H/s | ~3.9× |
 
-The single-thread hashrate dropped from ~0.19 H/s to ~0.16 H/s after the security fixes. This is **intentional** — `WRITE_NODE_PREFIX` was restored from 8 KiB to 128 KiB (Fix 2), forcing the full 128 KiB working set per node write and making memory-hardness meaningful again.
+The M1 single-thread hashrate dropped from ~0.19 H/s to ~0.16 H/s after the security fixes. This is **intentional** — `WRITE_NODE_PREFIX` was restored from 8 KiB to 128 KiB (Fix 2), forcing the full 128 KiB working set per node write and making memory-hardness meaningful again.
 
 Dataset generation is ~500 ms – 8 s depending on memory bandwidth (paid once per epoch).
 
@@ -391,19 +392,19 @@ Run the built-in benchmark to measure on your hardware:
 | Scrypt | 128 KiB | DRAM | ~100x | Memory-hard but small |
 | Argon2 | 256 MiB | DRAM | ~10x | Password hashing, not mining |
 | Ethash | 8 GiB | DRAM | ~2x | Dataset grows over time |
-| **EVO-OMAP** | **256 MiB** | **SRAM** | **2-5x** | **Mutable dataset** |
+| **EVO-OMAP** | **256 MiB** | **DRAM** | **2-5x** | **Mutable dataset** |
 
-EVO-OMAP's advantage: the mutable dataset with read-write dependence forces SRAM, which is silicon-intensive and cannot be easily pipelined like DRAM access.
+EVO-OMAP's advantage: the mutable dataset with random read-write dependence requires sustained high-bandwidth DRAM access that cannot be skipped, cached, or computed ahead of time.
 
 ## Security Considerations
 
 ### 1. Memory-Efficient Mining
 
-An ASIC with 256 MiB SRAM could potentially:
-- Cache the entire dataset on-chip
-- Compute at lower memory bandwidth
+An ASIC with dedicated high-bandwidth DRAM could potentially:
+- Cache the entire dataset closer to compute
+- Achieve higher memory bandwidth than commodity DRAM
 
-However, SRAM at 256 MiB requires significant die area, limiting other optimizations.
+However, 256 MiB of high-bandwidth DRAM requires significant board area and power budget, limiting the parallel instances an ASIC can run.
 
 ### 2. Light Client Trust
 
@@ -425,7 +426,7 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 | 2.1 | `WRITE_NODE_PREFIX` 8 KiB → 128 KiB | Restores 128 KiB memory working set per step |
 | 2.3 | Write index mixes step counter | Prevents write-index prediction |
 | 3.2 | `mine_parallel` atomics: Release/Acquire + `compare_exchange` | Prevents data races on nonce result |
-| 3.5 | `DatasetCache` sentinel `u64::MAX` → `Option<u64>` | Prevents false cache hit at epoch 0 after regen |
+| 3.5 | `DatasetCache` sentinel `u64::MAX` → `Option<u64>` | Prevents false cache hit at astronomical block heights matching u64::MAX sentinel |
 | 4.2 | `LightDataset::set_node` length assertion | Catches malformed nodes at insert |
 | 2.4 | `PROGRAM_LENGTH` 8 → 64 | Increases computation per step |
 | 2.5 | Branch variants now each consume both nodes exactly once | Restores branch symmetry |
