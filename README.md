@@ -11,7 +11,7 @@ EVO-OMAP (Evolving Oriented Memory-hard Algorithm for Proof-of-work) is a memory
 | Memory Footprint | 256 MiB | Requires 256 MiB DRAM bandwidth |
 | Memory Access | Read-write per step | Random read-write pattern saturates DRAM bandwidth |
 | Branch Factor | 4-way | GPU warp efficiency reduced; CPUs with branch prediction excel |
-| Execution Model | Superscalar | 64 instructions per step with data-dependent operands |
+| Execution Model | Superscalar | 16 instructions per step with data-dependent operands |
 | State Size | 512 bits | Small enough for full in-register execution |
 | Dataset Chaining | Sequential | Nodes form a chain; no parallel precomputation |
 
@@ -102,16 +102,17 @@ At each of `T = 4096` steps:
    idx_w = (w₂ ⊕ w₃ ⊕ step) mod N
    ```
 
-2. **Program Generation**: Derive 64 instructions from state:
+2. **Program Generation**: Derive 16 instructions from state using golden-ratio mixing:
    ```
-   For i = 0 to 63:
+   For i = 0 to 15:
        word_idx = i mod 8
-       bit_offset = (i mod 8) × 8
-       selector = w[word_idx]
-       op = (selector >> bit_offset) & 0x07
-       dst = (selector >> (bit_offset + 3)) & 0x07
-       src = (selector >> (bit_offset + 6)) & 0x7F
+       selector = w[word_idx] + i × 0x9e3779b97f4a7c15  (wrapping, Knuth TAOCP)
+       op  = selector & 0x07
+       dst = (selector >> 3) & 0x07
+       src = (selector >> 6) & 0x7F
    ```
+   The golden-ratio constant (`2^64 / φ`) ensures that instructions sharing
+   the same `word_idx` (e.g. i=0 and i=8) produce distinct selectors.
 
 3. **Instruction Execution**: Each instruction accesses `node[src mod 128]`:
    ```
@@ -182,19 +183,19 @@ Difficulty `D` requires the 32-byte SHA3-256 final hash to have **at least D con
 
 Block times below are based on parallel hashrate since `--parallel` is recommended for mining.
 
-| Difficulty | Expected attempts | Acceptance rate | Block time @ 1.48 H/s (Ryzen 7 7700, 16 threads) | Block time @ 0.62 H/s (M1, 8 threads) |
+| Difficulty | Expected attempts | Acceptance rate | Block time @ 1.41 H/s (Ryzen 7 7700, 16 threads) | Block time @ 0.72 H/s (M1, 8 threads) |
 |-----------|------------------|-----------------|---------------------------------------------------|----------------------------------------|
 | 1 | 2 | ~50% | ~1 s | ~3 s |
-| 4 | 16 | ~6.25% | ~11 s | ~26 s |
-| 5 | 32 | ~3.1% | ~22 s | ~52 s |
-| 7 | 128 | ~0.78% | ~87 s | ~3.5 min |
-| 8 | 256 | ~0.39% | ~3 min | ~7 min |
-| 10 | 1,024 | ~0.098% | ~11.5 min | ~28 min |
-| 16 | 65,536 | ~0.0015% | ~12.3 hr | ~29 hr |
+| 4 | 16 | ~6.25% | ~11 s | ~22 s |
+| 5 | 32 | ~3.1% | ~23 s | ~44 s |
+| 7 | 128 | ~0.78% | ~91 s | ~3 min |
+| 8 | 256 | ~0.39% | ~3 min | ~6 min |
+| 10 | 1,024 | ~0.098% | ~12 min | ~24 min |
+| 16 | 65,536 | ~0.0015% | ~12.9 hr | ~25 hr |
 
 **Recommended difficulty for ~120s blocks:**
-- Solo miner, Ryzen 7 7700 (`--parallel`, 16 threads): **difficulty 7–8**
-- Solo miner, Apple M1 (`--parallel`, 8 threads): **difficulty 5–6**
+- Solo miner, Ryzen 7 7700 (`--parallel`, 16 threads): **difficulty 7** (~91 s expected)
+- Solo miner, Apple M1 (`--parallel`, 8 threads): **difficulty 6** (~89 s expected at 0.72 H/s)
 - Multi-miner network: difficulty is set dynamically by the blockchain code based on observed block times — evo-omap accepts whatever value is passed in
 
 The `difficulty` parameter your blockchain passes to `mine_parallel()` controls block time — evo-omap itself has no block-time concept.
@@ -255,7 +256,7 @@ The theoretical ASIC advantage is **bounded by memory**, not unbounded as with p
 | `NODE_SIZE` | 1,048,576 | 64 KiB - 16 MiB | Bytes per node |
 | `NUM_NODES` | 256 | 16 - 1024 | Dataset nodes |
 | `NUM_STEPS` | 4,096 | 512 - 65536 | Execution steps |
-| `PROGRAM_LENGTH` | 64 | 4 - 16 | Instructions per step |
+| `PROGRAM_LENGTH` | 16 | 4 - 16 | Instructions per step |
 | `WRITE_NODE_PREFIX` | 131,072 | Fixed | Bytes per node mixed into write step (128 KiB) |
 | `OPERAND_WORDS` | 128 | Fixed | Words per node for operand access |
 | `BRANCH_WAYS` | 4 | 2, 4, 8 | Branch variants |
@@ -300,8 +301,9 @@ use evo_omap::{
 // Single-threaded mining
 let nonce = mine(header, height, difficulty, max_attempts);
 
-// Multi-threaded mining (uses rayon, auto-detects CPU cores)
-let nonce = mine_parallel(header, height, difficulty, max_attempts, num_threads);
+// Multi-threaded mining — pass num_threads=0 to auto-detect CPU cores
+// (equivalent to passing rayon::current_num_threads())
+let nonce = mine_parallel(header, height, difficulty, max_attempts, 0);
 
 // Full verification (requires 256 MiB)
 let valid = verify(header, height, nonce, difficulty);
@@ -340,9 +342,6 @@ cargo run -- verify <header_hex> <height> <nonce> <difficulty> light
 # Compute hash
 cargo run -- hash <header_hex> <height> <nonce>
 
-# Benchmark (dataset gen, hashing, verification)
-cargo run -- bench <header_hex> <height> <difficulty> [iterations]
-
 # Epoch seed
 cargo run -- seed <height>
 ```
@@ -352,16 +351,14 @@ cargo run -- seed <height>
 ### Minimal blockchain integration
 
 ```rust
-use evo_omap::{mine_parallel, verify, compute_epoch_seed, 
-               generate_dataset, current_num_threads};
+use evo_omap::{mine_parallel, verify};
 
-// Mining a new block
+// Mining a new block (num_threads=0 auto-detects CPU cores)
 fn mine_block(header: &[u8], height: u64, difficulty: u64) 
     -> Option<u64> {
     let max_attempts = 1 << (difficulty + 4); // 16x expected attempts
-    let threads = current_num_threads();
     let (nonce, _) = mine_parallel(
-        header, height, difficulty, max_attempts, threads
+        header, height, difficulty, max_attempts, 0
     );
     nonce
 }
@@ -394,8 +391,9 @@ fn adjust_difficulty(current_difficulty: u64,
 ```
 
 ### Epoch boundary handling
-The dataset regenerates every 1024 blocks (~34 hours at 120s blocks).
-Use DatasetCache to avoid regenerating on every block:
+The dataset regenerates every 1024 blocks — approximately one day of blocks
+at a 120 s target block time (~34 hours). Use DatasetCache to avoid
+regenerating on every block:
 
 ```rust
 let mut cache = DatasetCache::new();
@@ -425,9 +423,9 @@ Performance optimizations for production mining:
 | Platform | Mode | Per-hash | Hashrate | Parallel speedup |
 |----------|------|----------|----------|-----------------|
 | Windows Ryzen 7 7700 (16 cores) | Single thread | ~3.6 s | ~0.28 H/s | — |
-| Windows Ryzen 7 7700 (16 cores) | `--parallel` 16 threads | — | ~1.48 H/s | ~5.3× |
+| Windows Ryzen 7 7700 (16 cores) | `--parallel` 16 threads | — | ~1.41 H/s | ~5.0× |
 | Mac M1 (8 cores) | Single thread | ~6.1 s | ~0.16 H/s | — |
-| Mac M1 (8 cores) | `--parallel` 8 threads | — | ~0.62 H/s | ~3.9× |
+| Mac M1 (8 cores) | `--parallel` 8 threads | — | ~0.72 H/s | ~4.5× |
 
 The M1 single-thread hashrate dropped from ~0.19 H/s to ~0.16 H/s after the security fixes. This is **intentional** — `WRITE_NODE_PREFIX` was restored from 8 KiB to 128 KiB (Fix 2), forcing the full 128 KiB working set per node write and making memory-hardness meaningful again.
 
@@ -477,9 +475,11 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 
 ### 4. Security Fixes
 
+**Security audit summary:** 20 areas reviewed — 17 passed outright, 3 findings identified, all 3 addressed.
+
 **Commit `e37129f`** fixed three critical bugs affecting difficulty and verification logic (broken `u64::MAX / difficulty` target, `verify()` accepting arbitrary nonces, `verify_light()` hash divergence from full verify).
 
-**Current commit** applied 12 further fixes from a full audit:
+**Commit `249cad7`** applied 12 further fixes from the full audit:
 
 | Finding | Fix | Impact |
 |---------|-----|--------|
@@ -489,7 +489,7 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 | 3.2 | `mine_parallel` atomics: Release/Acquire + `compare_exchange` | Prevents data races on nonce result |
 | 3.5 | `DatasetCache` sentinel `u64::MAX` → `Option<u64>` | Prevents false cache hit at astronomical block heights matching u64::MAX sentinel |
 | 4.2 | `LightDataset::set_node` length assertion | Catches malformed nodes at insert |
-| 2.4 | `PROGRAM_LENGTH` 8 → 64 | Increases computation per step |
+| 2.4 | `PROGRAM_LENGTH` 8 → 16 with golden-ratio mixing | Increases computation per step; position-dependent selectors prevent repeated instructions |
 | 2.5 | Branch variants now each consume both nodes exactly once | Restores branch symmetry |
 | 1.2 | Domain separators length-prefixed at all 13 call sites | Prevents cross-domain collisions |
 | 4.5 | Remove dead `Cache`/`generate_cache` code | Removes unused attack surface |
@@ -550,20 +550,36 @@ Key innovations:
 
 ## Changelog
 
-### v0.1.0 (current)
+### v0.2.0 (current)
+- **mine_parallel(0) auto-detects threads** (commit `3218cf7`): passing
+  `num_threads=0` now maps to `rayon::current_num_threads()` instead of
+  silently returning `None` with no work attempted
+- **Program generation fix** (commit `a85a9b6`): fixed instruction
+  repetition bug in `generate_program`; instructions now use
+  golden-ratio mixing (`0x9e3779b97f4a7c15`) so slots sharing the same
+  `word_idx` produce distinct selectors
+- **Security audit complete**: 20 areas reviewed, 17 passed, 3 findings
+  identified — all 3 addressed (see Security Fixes table)
+- README synced with final benchmark numbers (Ryzen 1.41 H/s,
+  M1 0.72 H/s parallel) and audit results
+- `PROGRAM_LENGTH` corrected to 16 throughout documentation
+- Removed `authors` field from Cargo.toml
+- 87 tests passing, 0 failures
+
+### v0.1.0
 - Initial implementation of EVO-OMAP algorithm
-- Critical security fix (commit e37129f): broken difficulty target,
-  verify() accepting arbitrary nonces, verify_light() hash divergence
+- Critical security fix (commit `e37129f`): broken difficulty target,
+  `verify()` accepting arbitrary nonces, `verify_light()` hash divergence
 - 12 further security fixes from full audit (see Security Fixes table)
 - Performance optimizations: +27% hashrate on M1, +115% on Windows
-  Intel via node clone elimination and operand array truncation
+  Ryzen via node clone elimination and operand array truncation
 - Parallel mining via atomic work-stealing nonce counter
 - 87 tests passing, 0 failures
 
 ### API Stability
-This is v0.1 — the API is not yet stable. Breaking changes may occur
-before v1.0. Pin to a specific commit hash if building production 
-systems on top of this library.
+The API is not yet stable. Breaking changes may occur before v1.0.
+Pin to a specific commit hash if building production systems on top
+of this library.
 
 ## Contributing
 
@@ -572,7 +588,9 @@ cargo test --release         # full suite (~12 minutes)
 cargo test --release -- --ignored   # should return 0 ignored
 
 ### Running benchmarks
+```bash
 ./target/release/evo-omap mine 00 0 4 10000 --parallel
+```
 
 ### Submitting changes
 - All 87 tests must pass before submitting a PR
