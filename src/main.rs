@@ -3,10 +3,17 @@ use std::process;
 use std::time::Instant;
 
 use evo_omap::{
-    mine, mine_parallel, verify, verify_light, compute_epoch_seed, generate_dataset,
-    evo_omap_hash, evo_omap_hash_with_buffers, HashBuffers, CowDataset,
-    current_num_threads,
+    CowDataset, HashBuffers, compute_epoch_seed,
+    compute_epoch_seed_with_epoch_length_and_seed_material, current_num_threads, evo_omap_hash,
+    evo_omap_hash_with_buffers, generate_dataset, mine, mine_parallel, verify, verify_light,
 };
+
+fn leading_zero_bits(hash: &[u8; 32]) -> u64 {
+    hash.iter()
+        .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+        .take_while(|&b| b == 0)
+        .count() as u64
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -14,11 +21,20 @@ fn main() {
     if args.len() < 2 {
         eprintln!("EVO-OMAP Proof-of-Work");
         eprintln!("Usage:");
-        eprintln!("  {} mine <header_hex> <height> <difficulty> [max_nonce] [--parallel [threads]]", args[0]);
-        eprintln!("  {} verify <header_hex> <height> <nonce> <difficulty> [light]", args[0]);
+        eprintln!(
+            "  {} mine <header_hex> <height> <difficulty> [max_nonce] [--parallel [threads]]",
+            args[0]
+        );
+        eprintln!(
+            "  {} verify <header_hex> <height> <nonce> <difficulty> [light]",
+            args[0]
+        );
         eprintln!("  {} hash <header_hex> <height> <nonce>", args[0]);
-        eprintln!("  {} seed <height>", args[0]);
-        eprintln!("  {} bench <header_hex> <height> <difficulty> [iterations]", args[0]);
+        eprintln!("  {} seed <height> [seed_material_hex]", args[0]);
+        eprintln!(
+            "  {} bench <header_hex> <height> <difficulty> [iterations]",
+            args[0]
+        );
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} mine 00 0 1 1000000", args[0]);
@@ -32,7 +48,10 @@ fn main() {
         "mine" => {
             let mut pos = 2;
             if args.len() < 5 {
-                eprintln!("Usage: {} mine <header_hex> <height> <difficulty> [max_nonce] [--parallel [threads]]", args[0]);
+                eprintln!(
+                    "Usage: {} mine <header_hex> <height> <difficulty> [max_nonce] [--parallel [threads]]",
+                    args[0]
+                );
                 process::exit(1);
             }
             let header_hex = &args[pos];
@@ -73,13 +92,16 @@ fn main() {
             println!("Height: {}", height);
             println!("Difficulty: {}", difficulty);
             println!("Max nonce attempts: {}", max_nonce);
-            let expected_attempts = 1u64.checked_shl(difficulty as u32)
-                .unwrap_or(u64::MAX);
+            let expected_attempts = 1u64.checked_shl(difficulty as u32).unwrap_or(u64::MAX);
             if max_nonce < expected_attempts {
-                println!("Warning: max_nonce ({}) may be too low for difficulty {}.",
-                    max_nonce, difficulty);
-                println!("Expected attempts needed: ~{}. Consider increasing max_nonce.",
-                    expected_attempts);
+                println!(
+                    "Warning: max_nonce ({}) may be too low for difficulty {}.",
+                    max_nonce, difficulty
+                );
+                println!(
+                    "Expected attempts needed: ~{}. Consider increasing max_nonce.",
+                    expected_attempts
+                );
                 println!();
             }
             if parallel {
@@ -102,7 +124,10 @@ fn main() {
                     println!("Found valid nonce: {}", nonce);
                     println!("Nonce (hex): 0x{:x}", nonce);
                     println!("Hash attempts: {}", attempts);
-                    println!("Hashrate: {:.2} H/s", attempts as f64 / mine_time.as_secs_f64());
+                    println!(
+                        "Hashrate: {:.2} H/s",
+                        attempts as f64 / mine_time.as_secs_f64()
+                    );
                 }
                 None => {
                     println!("No valid nonce found in {} attempts.", attempts);
@@ -113,7 +138,10 @@ fn main() {
 
         "verify" => {
             if args.len() < 6 {
-                eprintln!("Usage: {} verify <header_hex> <height> <nonce> <difficulty> [light]", args[0]);
+                eprintln!(
+                    "Usage: {} verify <header_hex> <height> <nonce> <difficulty> [light]",
+                    args[0]
+                );
                 process::exit(1);
             }
             let header_hex = &args[2];
@@ -173,17 +201,35 @@ fn main() {
 
         "seed" => {
             if args.len() < 3 {
-                eprintln!("Usage: {} seed <height>", args[0]);
+                eprintln!("Usage: {} seed <height> [seed_material_hex]", args[0]);
                 process::exit(1);
             }
             let height: u64 = args[2].parse().expect("Invalid height");
-            let seed = compute_epoch_seed(height);
+            let seed_material = if args.len() > 3 {
+                match hex::decode(&args[3]) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        eprintln!("Invalid seed material hex: {}", e);
+                        process::exit(1);
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let seed = if seed_material.is_empty() {
+                compute_epoch_seed(height)
+            } else {
+                compute_epoch_seed_with_epoch_length_and_seed_material(height, 1024, &seed_material)
+            };
             println!("Epoch seed: {}", hex::encode(seed.0));
         }
 
         "bench" => {
             if args.len() < 5 {
-                eprintln!("Usage: {} bench <header_hex> <height> <difficulty> [iterations]", args[0]);
+                eprintln!(
+                    "Usage: {} bench <header_hex> <height> <difficulty> [iterations]",
+                    args[0]
+                );
                 process::exit(1);
             }
             let header_hex = &args[2];
@@ -220,21 +266,32 @@ fn main() {
             println!();
 
             // Single hash benchmark
-            let _target = u64::MAX / difficulty;
             let mut cow_dataset = CowDataset::new(&dataset);
             let mut buffers = HashBuffers::new();
 
             let hash_start = Instant::now();
             for nonce in 0..iterations {
                 cow_dataset.reset();
-                let pow_hash = evo_omap_hash_with_buffers(&mut cow_dataset, &header, height, nonce, &mut buffers);
+                let pow_hash = evo_omap_hash_with_buffers(
+                    &mut cow_dataset,
+                    &header,
+                    height,
+                    nonce,
+                    &mut buffers,
+                );
                 let _ = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
             }
             let hash_time = hash_start.elapsed();
             println!("Per-hash benchmark ({} iterations):", iterations);
             println!("  Total time: {:.3} ms", hash_time.as_secs_f64() * 1000.0);
-            println!("  Per hash: {:.3} ms", hash_time.as_secs_f64() * 1000.0 / iterations as f64);
-            println!("  Hashrate: {:.2} H/s", iterations as f64 / hash_time.as_secs_f64());
+            println!(
+                "  Per hash: {:.3} ms",
+                hash_time.as_secs_f64() * 1000.0 / iterations as f64
+            );
+            println!(
+                "  Hashrate: {:.2} H/s",
+                iterations as f64 / hash_time.as_secs_f64()
+            );
             println!();
 
             // Light verification benchmark
@@ -245,8 +302,14 @@ fn main() {
             }
             let light_time = light_start.elapsed();
             println!("  Total time: {:.3} ms", light_time.as_secs_f64() * 1000.0);
-            println!("  Per verification: {:.3} ms", light_time.as_secs_f64() * 1000.0 / iterations as f64);
-            println!("  Verification/s: {:.2}", iterations as f64 / light_time.as_secs_f64());
+            println!(
+                "  Per verification: {:.3} ms",
+                light_time.as_secs_f64() * 1000.0 / iterations as f64
+            );
+            println!(
+                "  Verification/s: {:.2}",
+                iterations as f64 / light_time.as_secs_f64()
+            );
             println!();
 
             // Full verification benchmark
@@ -257,15 +320,25 @@ fn main() {
             let full_start = Instant::now();
             for nonce in 0..full_iterations {
                 cow_ds_full.reset();
-                let pow_hash = evo_omap_hash_with_buffers(&mut cow_ds_full, &header, height, nonce, &mut buffers_full);
-                let hash_int = u64::from_be_bytes(pow_hash.0[..8].try_into().unwrap());
-                let target_full = u64::MAX / difficulty;
-                let _valid = hash_int < target_full;
+                let pow_hash = evo_omap_hash_with_buffers(
+                    &mut cow_ds_full,
+                    &header,
+                    height,
+                    nonce,
+                    &mut buffers_full,
+                );
+                let _valid = leading_zero_bits(&pow_hash.0) >= difficulty;
             }
             let full_time = full_start.elapsed();
             println!("  Total time: {:.3} ms", full_time.as_secs_f64() * 1000.0);
-            println!("  Per verification: {:.3} ms", full_time.as_secs_f64() * 1000.0 / full_iterations as f64);
-            println!("  Verification/s: {:.2}", full_iterations as f64 / full_time.as_secs_f64());
+            println!(
+                "  Per verification: {:.3} ms",
+                full_time.as_secs_f64() * 1000.0 / full_iterations as f64
+            );
+            println!(
+                "  Verification/s: {:.2}",
+                full_iterations as f64 / full_time.as_secs_f64()
+            );
         }
 
         _ => {

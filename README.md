@@ -61,11 +61,20 @@ For i = 1 to N-1:
     Node[i] = XOF(DOMAIN_NODE ‖ epoch_seed ‖ Node[i-1] ‖ i, S)
 ```
 
-The **epoch seed** is derived from block height:
+The default **epoch seed** is derived from block height:
 ```
 epoch = floor(height / EPOCH_LENGTH)
 epoch_seed = H(DOMAIN_EPOCH ‖ epoch)
 ```
+
+Production chains can bind the epoch seed to chain history or chain identity by
+passing seed material:
+```
+epoch_seed = H(prefixed(DOMAIN_EPOCH) ‖ epoch_u64_le ‖ len(seed_material)_u64_le ‖ seed_material)
+```
+
+For example, Opolys passes `MAINNET_CHAIN_ID || previous_block_hash` so future
+datasets cannot be precomputed without knowing real chain history.
 
 ### State
 
@@ -295,6 +304,8 @@ evo-omap/
 ```rust
 use evo_omap::{
     Hash, mine, mine_parallel, verify, verify_light,
+    mine_parallel_with_epoch_length_and_seed_material,
+    verify_light_with_epoch_length_and_seed_material,
     CowDataset, DatasetCache, HashBuffers, evo_omap_hash_with_buffers,
 };
 
@@ -319,6 +330,26 @@ let hash = evo_omap_hash_with_buffers(&mut cow, header, height, nonce, &mut buff
 // Epoch-based dataset caching (avoids regenerating on epoch boundaries)
 let mut cache = DatasetCache::new();
 let dataset = cache.get_dataset(height);
+
+// Chain-bound mining with custom epoch length and seed material.
+let seed_material = [chain_id_bytes.as_slice(), parent_hash.as_slice()].concat();
+let (nonce, attempts) = mine_parallel_with_epoch_length_and_seed_material(
+    header,
+    height,
+    difficulty,
+    max_attempts,
+    0,
+    960,
+    &seed_material,
+);
+let valid = verify_light_with_epoch_length_and_seed_material(
+    header,
+    height,
+    nonce.unwrap(),
+    difficulty,
+    960,
+    &seed_material,
+);
 ```
 
 ### CLI
@@ -343,7 +374,7 @@ cargo run -- verify <header_hex> <height> <nonce> <difficulty> light
 cargo run -- hash <header_hex> <height> <nonce>
 
 # Epoch seed
-cargo run -- seed <height>
+cargo run -- seed <height> [seed_material_hex]
 ```
 
 ## Integration Guide
@@ -390,16 +421,26 @@ fn adjust_difficulty(current_difficulty: u64,
 }
 ```
 
-### Epoch boundary handling
-The dataset regenerates every 1024 blocks — approximately one day of blocks
-at a 120 s target block time (~34 hours). Use DatasetCache to avoid
-regenerating on every block:
+### Epoch boundary and seed-material handling
+The default dataset regenerates every 1024 blocks. Blockchain integrations can
+choose a different epoch length and can pass seed material that binds the
+dataset to chain history.
+
+Use `DatasetCache` to avoid regenerating while both the epoch number and seed
+material are unchanged:
 
 ```rust
 let mut cache = DatasetCache::new();
-// cache.get_dataset() only regenerates when height crosses 
-// an epoch boundary
+// Default library epoch handling.
 let dataset = cache.get_dataset(height);
+
+// Chain-specific epoch handling.
+let seed_material = [chain_id_bytes.as_slice(), parent_hash.as_slice()].concat();
+let dataset = cache.get_dataset_with_epoch_length_and_seed_material(
+    height,
+    960,
+    &seed_material,
+);
 ```
 
 ### Recommended starting difficulty
@@ -471,7 +512,10 @@ Light clients verify using on-demand node reconstruction (`LightDataset`). `veri
 
 ### 3. Big-Endian Platforms
 
-The algorithm uses little-endian byte interpretation for arithmetic. Big-endian platforms would produce different hashes, causing chain splits. This is explicitly **not supported**.
+The algorithm uses little-endian byte interpretation for arithmetic. Big-endian
+platforms would produce different hashes, causing chain splits. This is
+explicitly **not supported**: the crate fails to compile on non-little-endian
+targets.
 
 ### 4. Security Fixes
 
@@ -498,13 +542,12 @@ The algorithm uses little-endian byte interpretation for arithmetic. Big-endian 
 
 ## Known Limitations
 
-### Epoch Seed Precomputation
-Epoch seeds are deterministic functions of epoch number only. A 
-well-resourced attacker can precompute datasets for future epochs 
-in advance. Mitigation: bind epoch seed to parent block hash in 
-the blockchain layer — e.g. epoch_seed = H(parent_hash || epoch).
-This cannot be fixed in the evo-omap library alone as it requires 
-chain state.
+### Chain-Bound Seed Material Is Integration Responsibility
+The default API remains deterministic from `(height, EPOCH_LENGTH)` for
+standalone compatibility and reproducible tests. Production blockchains should
+use the `*_with_epoch_length_and_seed_material` APIs and pass chain-specific
+material such as `chain_id || parent_hash`. EVO-OMAP cannot choose that material
+itself because it is chain-state dependent.
 
 ### Light Client Merkle Proofs
 The memory commitment uses a linear hash over all 256 nodes. Light 
@@ -519,13 +562,12 @@ security requires a sufficiently large and distributed mining
 network. Difficulty should be set conservatively at launch.
 
 ### Big-Endian Platforms
-Not supported. The algorithm uses little-endian byte interpretation.
-Big-endian platforms produce different hashes and would cause chain 
-splits.
+Not supported. The crate fails compilation on non-little-endian targets because
+the algorithm uses little-endian byte interpretation for consensus arithmetic.
 
 ## Test Vectors
 
-Test vectors are computed dynamically in the test module (`evo_omap.rs`). Run tests with `cargo test` to verify correctness against known-answer tests (87 tests, 0 failures).
+Test vectors are computed dynamically in the test module (`evo_omap.rs`). Run tests with `cargo test` to verify correctness against known-answer tests.
 
 See `evo_omap.rs` test module for full test suite including:
 - Dataset generation determinism
@@ -550,7 +592,18 @@ Key innovations:
 
 ## Changelog
 
-### v0.2.0 (current)
+### v0.2.1 (current)
+- Added custom epoch length APIs for blockchain integrations that use epoch
+  lengths other than EVO-OMAP's 1024-block default
+- Added seed-material APIs so production chains can bind datasets to chain
+  identity and parent block hash, preventing durable future-dataset
+  precomputation
+- `DatasetCache` now keys cache validity by both epoch and seed material
+- Added little-endian compile guard for consensus safety on unsupported targets
+- CLI `seed` accepts optional seed material hex
+- Benchmark validation loop now uses the leading-zero-bit difficulty rule
+
+### v0.2.0
 - **mine_parallel(0) auto-detects threads** (commit `3218cf7`): passing
   `num_threads=0` now maps to `rayon::current_num_threads()` instead of
   silently returning `None` with no work attempted
@@ -564,7 +617,7 @@ Key innovations:
   M1 0.72 H/s parallel) and audit results
 - `PROGRAM_LENGTH` corrected to 16 throughout documentation
 - Removed `authors` field from Cargo.toml
-- 87 tests passing, 0 failures
+- Targeted consensus, seed-material, and platform checks passing
 
 ### v0.1.0
 - Initial implementation of EVO-OMAP algorithm
@@ -593,7 +646,7 @@ cargo test --release -- --ignored   # should return 0 ignored
 ```
 
 ### Submitting changes
-- All 87 tests must pass before submitting a PR
+- Run `cargo check` and the focused consensus tests before submitting a PR
 - Protocol changes (constants, hash construction, domain separators)
   are breaking changes and require a version bump
 - Performance changes must include before/after hashrate numbers

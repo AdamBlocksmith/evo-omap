@@ -3,28 +3,32 @@
 //! This module implements the EVO-OMAP algorithm. Protocol constants are
 //! defined in constants.rs. Public specification is in public_spec.rs.
 
+#[cfg(not(target_endian = "little"))]
+compile_error!("EVO-OMAP consensus implementation currently supports only little-endian targets");
+
 use std::sync::Arc;
 
 pub use crate::hash::{Hash, blake3_256, blake3_xof, blake3_xof_multi, sha3_256};
 pub use crate::public_spec::{
-    Instruction, Program,
-    STATE_SIZE as STATE_SIZE_SPEC,
-    PROGRAM_LENGTH_MIN, PROGRAM_LENGTH_MAX,
-    BRANCH_WAYS_MIN, BRANCH_WAYS_MAX,
-    STEPS_MIN, STEPS_MAX,
-    EPOCH_LENGTH_MIN, EPOCH_LENGTH_MAX,
-    DOMAIN_EPOCH, DOMAIN_NODE, DOMAIN_SEED,
-    DOMAIN_CACHE, DOMAIN_BRANCH, DOMAIN_COMMITMENT, DOMAIN_MEMORY,
+    BRANCH_WAYS_MAX, BRANCH_WAYS_MIN, DOMAIN_BRANCH, DOMAIN_CACHE, DOMAIN_COMMITMENT, DOMAIN_EPOCH,
+    DOMAIN_MEMORY, DOMAIN_NODE, DOMAIN_SEED, EPOCH_LENGTH_MAX, EPOCH_LENGTH_MIN, Instruction,
+    PROGRAM_LENGTH_MAX, PROGRAM_LENGTH_MIN, Program, STATE_SIZE as STATE_SIZE_SPEC, STEPS_MAX,
+    STEPS_MIN,
 };
 
 use crate::constants::{
-    NODE_SIZE, NUM_NODES, NUM_STEPS, PROGRAM_LENGTH, EPOCH_LENGTH,
-    BRANCH_MASK, SRC_MASK,
-    BRANCH_NODE_PREFIX, WRITE_NODE_PREFIX, STATE_HASH_PREFIX,
-    NUM_REGISTERS, OPERAND_WORDS,
+    BRANCH_MASK, BRANCH_NODE_PREFIX, EPOCH_LENGTH, NODE_SIZE, NUM_NODES, NUM_REGISTERS, NUM_STEPS,
+    OPERAND_WORDS, PROGRAM_LENGTH, SRC_MASK, STATE_HASH_PREFIX, WRITE_NODE_PREFIX,
 };
 
 pub use crate::public_spec::DatasetSpec;
+
+pub fn ensure_little_endian_platform() {
+    assert!(
+        cfg!(target_endian = "little"),
+        "EVO-OMAP consensus implementation currently supports only little-endian targets"
+    );
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct State(pub [u8; STATE_SIZE_SPEC]);
@@ -230,7 +234,11 @@ impl LightDataset {
     }
 
     pub fn set_node(&mut self, index: usize, node: Vec<u8>) {
-        assert_eq!(node.len(), NODE_SIZE, "node must be exactly NODE_SIZE bytes");
+        assert_eq!(
+            node.len(),
+            NODE_SIZE,
+            "node must be exactly NODE_SIZE bytes"
+        );
         self.modified_nodes[index] = Some(node);
     }
 
@@ -314,15 +322,30 @@ pub fn evo_omap_hash_light(
     sha3_256(&final_input)
 }
 
-fn compute_epoch_number(height: u64) -> u64 {
-    height / EPOCH_LENGTH
+pub fn compute_epoch_number_with_epoch_length(height: u64, epoch_length: u64) -> u64 {
+    assert!(epoch_length > 0, "epoch length must be non-zero");
+    height / epoch_length
 }
 
 pub fn compute_epoch_seed(height: u64) -> Hash {
-    let epoch = compute_epoch_number(height);
-    let mut data = Vec::with_capacity(16);
+    compute_epoch_seed_with_epoch_length(height, EPOCH_LENGTH)
+}
+
+pub fn compute_epoch_seed_with_epoch_length(height: u64, epoch_length: u64) -> Hash {
+    compute_epoch_seed_with_epoch_length_and_seed_material(height, epoch_length, &[])
+}
+
+pub fn compute_epoch_seed_with_epoch_length_and_seed_material(
+    height: u64,
+    epoch_length: u64,
+    seed_material: &[u8],
+) -> Hash {
+    let epoch = compute_epoch_number_with_epoch_length(height, epoch_length);
+    let mut data = Vec::with_capacity(24 + seed_material.len());
     data.extend_from_slice(&prefixed_domain(DOMAIN_EPOCH));
     data.extend_from_slice(&epoch.to_le_bytes());
+    data.extend_from_slice(&(seed_material.len() as u64).to_le_bytes());
+    data.extend_from_slice(seed_material);
     blake3_256(&data)
 }
 
@@ -374,8 +397,7 @@ pub fn generate_program(state: &State) -> Program {
         // Mix a position-dependent constant into the word so that slots sharing
         // the same word_idx (e.g. i=0 and i=8) produce distinct selectors.
         // The constant is the 64-bit golden-ratio multiplier (Knuth, TAOCP).
-        let selector = words[word_idx]
-            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let selector = words[word_idx].wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
 
         let op_bits = selector & 0x07;
         let dst = ((selector >> 3) & 0x07) as u8;
@@ -402,8 +424,7 @@ fn fill_program_buffer(words: &[u64; 8], buf: &mut Vec<Instruction>) {
     buf.clear();
     for i in 0..PROGRAM_LENGTH {
         let word_idx = i % NUM_REGISTERS;
-        let selector = words[word_idx]
-            .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let selector = words[word_idx].wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
         let op_bits = selector & 0x07;
         let dst = ((selector >> 3) & 0x07) as u8;
         let src = ((selector >> 6) & SRC_MASK) as u8;
@@ -422,7 +443,12 @@ fn fill_program_buffer(words: &[u64; 8], buf: &mut Vec<Instruction>) {
     }
 }
 
-fn execute_instructions(state: &mut State, instructions: &[Instruction], node1: &[u8], node2: &[u8]) {
+fn execute_instructions(
+    state: &mut State,
+    instructions: &[Instruction],
+    node1: &[u8],
+    node2: &[u8],
+) {
     let node1_words = node_as_u64_array(node1);
     let node2_words = node_as_u64_array(node2);
     let mut state_arr = state.as_u64_array();
@@ -438,10 +464,12 @@ pub fn derive_indices(state: &State, step: u64) -> (usize, usize, usize) {
 }
 
 fn derive_indices_from_words(words: &[u64; 8], step: u64) -> (usize, usize, usize) {
-    let idx1 = (words[0].wrapping_add(step)
+    let idx1 = (words[0]
+        .wrapping_add(step)
         .wrapping_mul(words[4].wrapping_add(1))
         % NUM_NODES as u64) as usize;
-    let idx2 = (words[1].wrapping_mul(step.wrapping_add(1))
+    let idx2 = (words[1]
+        .wrapping_mul(step.wrapping_add(1))
         .wrapping_add(words[5])
         % NUM_NODES as u64) as usize;
     let idx_write = ((words[2] ^ words[3] ^ step) % NUM_NODES as u64) as usize;
@@ -458,12 +486,7 @@ fn node_as_u64_array(node: &[u8]) -> Vec<u64> {
     words
 }
 
-pub fn execute_program(
-    state: &mut State,
-    program: &Program,
-    node1: &[u8],
-    node2: &[u8],
-) {
+pub fn execute_program(state: &mut State, program: &Program, node1: &[u8], node2: &[u8]) {
     let node1_words = node_as_u64_array(node1);
     let node2_words = node_as_u64_array(node2);
     let mut state_arr = state.as_u64_array();
@@ -475,12 +498,7 @@ pub fn execute_program(
     state.write_all_u64(&state_arr);
 }
 
-pub fn apply_branch(
-    state: &mut State,
-    step: u32,
-    node1: &[u8],
-    node2: &[u8],
-) {
+pub fn apply_branch(state: &mut State, step: u32, node1: &[u8], node2: &[u8]) {
     let words = state.as_u64_array();
     let branch_variant = (words[0] & BRANCH_MASK) as u8;
     let state_bytes = state.as_bytes();
@@ -658,8 +676,12 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
     let mut state = State::from_seed(&seed);
 
     buffers.commitment_data.clear();
-    buffers.commitment_data.extend_from_slice(&prefixed_domain(DOMAIN_COMMITMENT));
-    buffers.commitment_data.extend_from_slice(&height.to_le_bytes());
+    buffers
+        .commitment_data
+        .extend_from_slice(&prefixed_domain(DOMAIN_COMMITMENT));
+    buffers
+        .commitment_data
+        .extend_from_slice(&height.to_le_bytes());
     let mut commitment_hash = blake3_256(&buffers.commitment_data);
 
     for step in 0..NUM_STEPS {
@@ -670,30 +692,53 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
         {
             let s = dataset.get(idx1);
             buffers.node1_prefix.clear();
-            buffers.node1_prefix.extend_from_slice(&s[..WRITE_NODE_PREFIX]);
+            buffers
+                .node1_prefix
+                .extend_from_slice(&s[..WRITE_NODE_PREFIX]);
         }
         {
             let s = dataset.get(idx2);
             buffers.node2_prefix.clear();
-            buffers.node2_prefix.extend_from_slice(&s[..WRITE_NODE_PREFIX]);
+            buffers
+                .node2_prefix
+                .extend_from_slice(&s[..WRITE_NODE_PREFIX]);
         }
 
-        execute_instructions(&mut state, &buffers.program_buf, &buffers.node1_prefix, &buffers.node2_prefix);
+        execute_instructions(
+            &mut state,
+            &buffers.program_buf,
+            &buffers.node1_prefix,
+            &buffers.node2_prefix,
+        );
 
-        apply_branch_with_buffer(&mut state, step as u32, &buffers.node1_prefix, &buffers.node2_prefix, &mut buffers.branch_input);
+        apply_branch_with_buffer(
+            &mut state,
+            step as u32,
+            &buffers.node1_prefix,
+            &buffers.node2_prefix,
+            &mut buffers.branch_input,
+        );
 
         let state_bytes = state.as_bytes();
         buffers.write_data.clear();
         buffers.write_data.extend_from_slice(&buffers.node1_prefix);
         buffers.write_data.extend_from_slice(&buffers.node2_prefix);
-        buffers.write_data.extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
+        buffers
+            .write_data
+            .extend_from_slice(&state_bytes[..STATE_HASH_PREFIX]);
         let written = blake3_xof(&buffers.write_data, NODE_SIZE);
         dataset.set(idx_write, written);
 
         buffers.commitment_input.clear();
-        buffers.commitment_input.extend_from_slice(commitment_hash.as_ref());
-        buffers.commitment_input.extend_from_slice(&(step as u64).to_le_bytes());
-        buffers.commitment_input.extend_from_slice(&state_bytes[..32]);
+        buffers
+            .commitment_input
+            .extend_from_slice(commitment_hash.as_ref());
+        buffers
+            .commitment_input
+            .extend_from_slice(&(step as u64).to_le_bytes());
+        buffers
+            .commitment_input
+            .extend_from_slice(&state_bytes[..32]);
         commitment_hash = blake3_256(&buffers.commitment_input);
     }
 
@@ -701,9 +746,15 @@ pub fn evo_omap_hash_with_buffers<D: DatasetLike>(
     let nodes = dataset.as_node_slice();
     let memory_commitment = compute_memory_commitment_from_slice(&nodes);
     buffers.final_input.clear();
-    buffers.final_input.extend_from_slice(state_summary.as_ref());
-    buffers.final_input.extend_from_slice(commitment_hash.as_ref());
-    buffers.final_input.extend_from_slice(memory_commitment.as_ref());
+    buffers
+        .final_input
+        .extend_from_slice(state_summary.as_ref());
+    buffers
+        .final_input
+        .extend_from_slice(commitment_hash.as_ref());
+    buffers
+        .final_input
+        .extend_from_slice(memory_commitment.as_ref());
 
     sha3_256(&buffers.final_input)
 }
@@ -761,10 +812,39 @@ pub fn mine(
     difficulty: u64,
     max_nonce_attempts: u64,
 ) -> (Option<u64>, u64) {
+    mine_with_epoch_length(header, height, difficulty, max_nonce_attempts, EPOCH_LENGTH)
+}
+
+pub fn mine_with_epoch_length(
+    header: &[u8],
+    height: u64,
+    difficulty: u64,
+    max_nonce_attempts: u64,
+    epoch_length: u64,
+) -> (Option<u64>, u64) {
+    mine_with_epoch_length_and_seed_material(
+        header,
+        height,
+        difficulty,
+        max_nonce_attempts,
+        epoch_length,
+        &[],
+    )
+}
+
+pub fn mine_with_epoch_length_and_seed_material(
+    header: &[u8],
+    height: u64,
+    difficulty: u64,
+    max_nonce_attempts: u64,
+    epoch_length: u64,
+    seed_material: &[u8],
+) -> (Option<u64>, u64) {
     if difficulty == 0 {
         return (None, 0);
     }
-    let epoch_seed = compute_epoch_seed(height);
+    let epoch_seed =
+        compute_epoch_seed_with_epoch_length_and_seed_material(height, epoch_length, seed_material);
     let base_dataset = generate_dataset(&epoch_seed);
     let mut cow_dataset = CowDataset::new(&base_dataset);
     let mut buffers = HashBuffers::new();
@@ -774,9 +854,12 @@ pub fn mine(
         cow_dataset.reset();
         attempts += 1;
 
-        let pow_hash = evo_omap_hash_with_buffers(&mut cow_dataset, header, height, nonce, &mut buffers);
+        let pow_hash =
+            evo_omap_hash_with_buffers(&mut cow_dataset, header, height, nonce, &mut buffers);
 
-        let leading_zeros = pow_hash.0.iter()
+        let leading_zeros = pow_hash
+            .0
+            .iter()
             .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
             .take_while(|&b| b == 0)
             .count() as u64;
@@ -798,6 +881,44 @@ pub fn mine_parallel(
     max_nonce_attempts: u64,
     num_threads: usize,
 ) -> (Option<u64>, u64) {
+    mine_parallel_with_epoch_length(
+        header,
+        height,
+        difficulty,
+        max_nonce_attempts,
+        num_threads,
+        EPOCH_LENGTH,
+    )
+}
+
+pub fn mine_parallel_with_epoch_length(
+    header: &[u8],
+    height: u64,
+    difficulty: u64,
+    max_nonce_attempts: u64,
+    num_threads: usize,
+    epoch_length: u64,
+) -> (Option<u64>, u64) {
+    mine_parallel_with_epoch_length_and_seed_material(
+        header,
+        height,
+        difficulty,
+        max_nonce_attempts,
+        num_threads,
+        epoch_length,
+        &[],
+    )
+}
+
+pub fn mine_parallel_with_epoch_length_and_seed_material(
+    header: &[u8],
+    height: u64,
+    difficulty: u64,
+    max_nonce_attempts: u64,
+    num_threads: usize,
+    epoch_length: u64,
+    seed_material: &[u8],
+) -> (Option<u64>, u64) {
     if difficulty == 0 {
         return (None, 0);
     }
@@ -806,7 +927,8 @@ pub fn mine_parallel(
     } else {
         num_threads
     };
-    let epoch_seed = compute_epoch_seed(height);
+    let epoch_seed =
+        compute_epoch_seed_with_epoch_length_and_seed_material(height, epoch_length, seed_material);
     let base_dataset = Arc::new(generate_dataset(&epoch_seed));
     let header = Arc::new(header.to_vec());
 
@@ -820,19 +942,24 @@ pub fn mine_parallel(
         let mut cow = CowDataset::new(&base_dataset);
 
         loop {
-            if found_flag.load(Ordering::Acquire) { break; }
+            if found_flag.load(Ordering::Acquire) {
+                break;
+            }
 
             let nonce = nonce_counter.fetch_add(1, Ordering::Relaxed);
-            if nonce >= max_nonce_attempts { break; }
+            if nonce >= max_nonce_attempts {
+                break;
+            }
 
             total_attempts.fetch_add(1, Ordering::Relaxed);
             cow.reset();
 
-            let pow_hash = evo_omap_hash_with_buffers(
-                &mut cow, &header, height, nonce, &mut buffers,
-            );
+            let pow_hash =
+                evo_omap_hash_with_buffers(&mut cow, &header, height, nonce, &mut buffers);
 
-            let leading_zeros = pow_hash.0.iter()
+            let leading_zeros = pow_hash
+                .0
+                .iter()
                 .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
                 .take_while(|&b| b == 0)
                 .count() as u64;
@@ -840,7 +967,10 @@ pub fn mine_parallel(
             if leading_zeros >= difficulty {
                 found_flag.store(true, Ordering::Release);
                 let _ = found_nonce.compare_exchange(
-                    u64::MAX, nonce, Ordering::Relaxed, Ordering::Relaxed,
+                    u64::MAX,
+                    nonce,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
                 );
                 break;
             }
@@ -857,6 +987,7 @@ pub fn mine_parallel(
 
 pub struct DatasetCache {
     epoch: Option<u64>,
+    seed_material_hash: Option<Hash>,
     dataset: Dataset,
 }
 
@@ -864,16 +995,36 @@ impl DatasetCache {
     pub fn new() -> Self {
         Self {
             epoch: None,
+            seed_material_hash: None,
             dataset: Dataset::new(),
         }
     }
 
     pub fn get_dataset(&mut self, height: u64) -> &Dataset {
-        let epoch = compute_epoch_number(height);
-        if self.epoch != Some(epoch) {
-            let epoch_seed = compute_epoch_seed(height);
+        self.get_dataset_with_epoch_length(height, EPOCH_LENGTH)
+    }
+
+    pub fn get_dataset_with_epoch_length(&mut self, height: u64, epoch_length: u64) -> &Dataset {
+        self.get_dataset_with_epoch_length_and_seed_material(height, epoch_length, &[])
+    }
+
+    pub fn get_dataset_with_epoch_length_and_seed_material(
+        &mut self,
+        height: u64,
+        epoch_length: u64,
+        seed_material: &[u8],
+    ) -> &Dataset {
+        let epoch = compute_epoch_number_with_epoch_length(height, epoch_length);
+        let seed_material_hash = blake3_256(seed_material);
+        if self.epoch != Some(epoch) || self.seed_material_hash != Some(seed_material_hash) {
+            let epoch_seed = compute_epoch_seed_with_epoch_length_and_seed_material(
+                height,
+                epoch_length,
+                seed_material,
+            );
             self.dataset = generate_dataset(&epoch_seed);
             self.epoch = Some(epoch);
+            self.seed_material_hash = Some(seed_material_hash);
         }
         &self.dataset
     }
@@ -885,42 +1036,89 @@ impl Default for DatasetCache {
     }
 }
 
-pub fn verify(
-    header: &[u8],
-    height: u64,
-    nonce: u64,
-    difficulty: u64,
-) -> bool {
-    if difficulty == 0 {
-        return false;
-    }
-    let epoch_seed = compute_epoch_seed(height);
-    let mut dataset = generate_dataset(&epoch_seed);
-    let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
-    pow_hash.0.iter()
-        .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
-        .take_while(|&b| b == 0)
-        .count() as u64 >= difficulty
+pub fn verify(header: &[u8], height: u64, nonce: u64, difficulty: u64) -> bool {
+    verify_with_epoch_length(header, height, nonce, difficulty, EPOCH_LENGTH)
 }
 
-pub fn verify_light(
+pub fn verify_with_epoch_length(
     header: &[u8],
     height: u64,
     nonce: u64,
     difficulty: u64,
+    epoch_length: u64,
+) -> bool {
+    verify_with_epoch_length_and_seed_material(header, height, nonce, difficulty, epoch_length, &[])
+}
+
+pub fn verify_with_epoch_length_and_seed_material(
+    header: &[u8],
+    height: u64,
+    nonce: u64,
+    difficulty: u64,
+    epoch_length: u64,
+    seed_material: &[u8],
 ) -> bool {
     if difficulty == 0 {
         return false;
     }
-    let epoch_seed = compute_epoch_seed(height);
+    let epoch_seed =
+        compute_epoch_seed_with_epoch_length_and_seed_material(height, epoch_length, seed_material);
+    let mut dataset = generate_dataset(&epoch_seed);
+    let pow_hash = evo_omap_hash(&mut dataset, header, height, nonce);
+    pow_hash
+        .0
+        .iter()
+        .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
+        .take_while(|&b| b == 0)
+        .count() as u64
+        >= difficulty
+}
+
+pub fn verify_light(header: &[u8], height: u64, nonce: u64, difficulty: u64) -> bool {
+    verify_light_with_epoch_length(header, height, nonce, difficulty, EPOCH_LENGTH)
+}
+
+pub fn verify_light_with_epoch_length(
+    header: &[u8],
+    height: u64,
+    nonce: u64,
+    difficulty: u64,
+    epoch_length: u64,
+) -> bool {
+    verify_light_with_epoch_length_and_seed_material(
+        header,
+        height,
+        nonce,
+        difficulty,
+        epoch_length,
+        &[],
+    )
+}
+
+pub fn verify_light_with_epoch_length_and_seed_material(
+    header: &[u8],
+    height: u64,
+    nonce: u64,
+    difficulty: u64,
+    epoch_length: u64,
+    seed_material: &[u8],
+) -> bool {
+    if difficulty == 0 {
+        return false;
+    }
+    let epoch_seed =
+        compute_epoch_seed_with_epoch_length_and_seed_material(height, epoch_length, seed_material);
     let mut dataset = LightDataset::new(&epoch_seed);
     dataset.reset();
 
     let pow_hash = evo_omap_hash_light(&mut dataset, header, height, nonce);
-    pow_hash.0.iter()
+    pow_hash
+        .0
+        .iter()
         .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
         .take_while(|&b| b == 0)
-        .count() as u64 >= difficulty
+        .count() as u64
+        >= difficulty
 }
 
 // =============================================================================
@@ -934,6 +1132,82 @@ mod tests {
     // =============================================================================
     // 1. DETERMINISM TESTS
     // =============================================================================
+
+    #[test]
+    fn consensus_platform_is_little_endian() {
+        ensure_little_endian_platform();
+        assert!(cfg!(target_endian = "little"));
+    }
+
+    #[test]
+    fn compute_epoch_seed_with_epoch_length_uses_custom_boundary() {
+        let default_seed_0 = compute_epoch_seed(0);
+        assert_eq!(default_seed_0, compute_epoch_seed(1023));
+        assert_ne!(default_seed_0, compute_epoch_seed(1024));
+
+        let custom_seed_0 = compute_epoch_seed_with_epoch_length(0, 960);
+        assert_eq!(
+            custom_seed_0,
+            compute_epoch_seed_with_epoch_length(959, 960)
+        );
+        assert_ne!(
+            custom_seed_0,
+            compute_epoch_seed_with_epoch_length(960, 960)
+        );
+        assert_eq!(
+            compute_epoch_seed_with_epoch_length(960, 960),
+            compute_epoch_seed_with_epoch_length(1023, 960)
+        );
+    }
+
+    #[test]
+    fn compute_epoch_seed_includes_seed_material() {
+        let seed_a = compute_epoch_seed_with_epoch_length_and_seed_material(960, 960, b"parent-a");
+        let seed_b = compute_epoch_seed_with_epoch_length_and_seed_material(960, 960, b"parent-b");
+        let seed_empty = compute_epoch_seed_with_epoch_length(960, 960);
+
+        assert_ne!(seed_a, seed_b);
+        assert_ne!(seed_a, seed_empty);
+    }
+
+    #[test]
+    fn dataset_cache_respects_custom_epoch_length() {
+        let mut cache = DatasetCache::new();
+
+        let node_at_0 = cache.get_dataset_with_epoch_length(0, 960).get(0).to_vec();
+        let node_at_959 = cache
+            .get_dataset_with_epoch_length(959, 960)
+            .get(0)
+            .to_vec();
+        let node_at_960 = cache
+            .get_dataset_with_epoch_length(960, 960)
+            .get(0)
+            .to_vec();
+
+        assert_eq!(node_at_0, node_at_959);
+        assert_ne!(node_at_0, node_at_960);
+    }
+
+    #[test]
+    fn dataset_cache_respects_seed_material() {
+        let mut cache = DatasetCache::new();
+
+        let node_parent_a = cache
+            .get_dataset_with_epoch_length_and_seed_material(960, 960, b"parent-a")
+            .get(0)
+            .to_vec();
+        let node_parent_a_again = cache
+            .get_dataset_with_epoch_length_and_seed_material(1023, 960, b"parent-a")
+            .get(0)
+            .to_vec();
+        let node_parent_b = cache
+            .get_dataset_with_epoch_length_and_seed_material(1023, 960, b"parent-b")
+            .get(0)
+            .to_vec();
+
+        assert_eq!(node_parent_a, node_parent_a_again);
+        assert_ne!(node_parent_a, node_parent_b);
+    }
 
     #[test]
     fn test_determinism_same_inputs_same_hash() {
@@ -994,12 +1268,18 @@ mod tests {
         let mut dataset2 = generate_dataset(&seed2);
         let hash2 = evo_omap_hash(&mut dataset2, header, height, nonce);
 
-        assert_ne!(hash1, hash2, "Different epoch seeds must produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "Different epoch seeds must produce different hashes"
+        );
 
         let mut dataset3 = generate_dataset(&seed);
         let hash3 = evo_omap_hash(&mut dataset3, b"different header", height, nonce);
 
-        assert_ne!(hash1, hash3, "Different headers must produce different hashes");
+        assert_ne!(
+            hash1, hash3,
+            "Different headers must produce different hashes"
+        );
     }
 
     #[test]
@@ -1048,7 +1328,13 @@ mod tests {
             data.extend_from_slice(&(i as u64).to_le_bytes());
 
             let expected = blake3_xof(&data, NODE_SIZE);
-            assert_eq!(ds.nodes[i], expected, "Node {} should be chained from node {}", i, i - 1);
+            assert_eq!(
+                ds.nodes[i],
+                expected,
+                "Node {} should be chained from node {}",
+                i,
+                i - 1
+            );
         }
     }
 
@@ -1059,7 +1345,12 @@ mod tests {
 
         for i in 0..NUM_NODES {
             assert_eq!(ds.nodes[i].len(), NODE_SIZE, "Node {} should be 1 MiB", i);
-            assert_eq!(ds.nodes[i].len(), 1_048_576, "Node {} should be exactly 1,048,576 bytes", i);
+            assert_eq!(
+                ds.nodes[i].len(),
+                1_048_576,
+                "Node {} should be exactly 1,048,576 bytes",
+                i
+            );
         }
     }
 
@@ -1077,9 +1368,18 @@ mod tests {
         let ds0 = generate_dataset(&seed0);
         let ds1 = generate_dataset(&seed1);
 
-        assert_ne!(ds0.nodes[0], ds1.nodes[0], "Different seeds produce different node 0");
-        assert_ne!(ds0.nodes[128], ds1.nodes[128], "Different seeds produce different node 128");
-        assert_ne!(ds0.nodes[255], ds1.nodes[255], "Different seeds produce different node 255");
+        assert_ne!(
+            ds0.nodes[0], ds1.nodes[0],
+            "Different seeds produce different node 0"
+        );
+        assert_ne!(
+            ds0.nodes[128], ds1.nodes[128],
+            "Different seeds produce different node 128"
+        );
+        assert_ne!(
+            ds0.nodes[255], ds1.nodes[255],
+            "Different seeds produce different node 255"
+        );
     }
 
     // =============================================================================
@@ -1299,7 +1599,7 @@ mod tests {
         assert_eq!(state[0], u64::MAX);
     }
 
-#[test]
+    #[test]
     fn test_instruction_mul_wrapping() {
         let mut state = [2u64, 0, 0, 0, 0, 0, 0, 0];
         let mut node1_words = [0u64; 128];
@@ -1408,7 +1708,11 @@ mod tests {
         }
         assert!(any_different, "Branch must modify state via XOR");
 
-        assert_ne!(s1.as_u64_array(), s2.as_u64_array(), "Different states must produce different branches");
+        assert_ne!(
+            s1.as_u64_array(),
+            s2.as_u64_array(),
+            "Different states must produce different branches"
+        );
     }
 
     #[test]
@@ -1429,8 +1733,12 @@ mod tests {
 
         for i in 0..4 {
             let percentage = counts[i] as f64 / 10000.0;
-            assert!(percentage > 0.15 && percentage < 0.40,
-                "Branch {} has {}%, expected 20-35%", i, percentage * 100.0);
+            assert!(
+                percentage > 0.15 && percentage < 0.40,
+                "Branch {} has {}%, expected 20-35%",
+                i,
+                percentage * 100.0
+            );
         }
     }
 
@@ -1457,7 +1765,10 @@ mod tests {
         let _hash = evo_omap_hash(&mut ds, header, height, nonce);
 
         let final_node_100 = ds.get(100).to_vec();
-        assert_ne!(original_node_100, final_node_100, "Dataset node should be modified");
+        assert_ne!(
+            original_node_100, final_node_100,
+            "Dataset node should be modified"
+        );
     }
 
     #[test]
@@ -1480,7 +1791,11 @@ mod tests {
         let _hash2 = evo_omap_hash(&mut ds2, header, height, nonce);
 
         for i in 0..NUM_NODES {
-            assert_eq!(ds1.nodes[i], ds2.nodes[i], "Same inputs must produce same write at node {}", i);
+            assert_eq!(
+                ds1.nodes[i], ds2.nodes[i],
+                "Same inputs must produce same write at node {}",
+                i
+            );
         }
     }
 
@@ -1515,7 +1830,10 @@ mod tests {
         let mut ds2 = generate_dataset(&seed);
         let h2 = evo_omap_hash(&mut ds2, header, height, 1);
 
-        assert_ne!(h1, h2, "Different nonces must produce different hashes and thus different final commitments");
+        assert_ne!(
+            h1, h2,
+            "Different nonces must produce different hashes and thus different final commitments"
+        );
     }
 
     // =============================================================================
@@ -1552,7 +1870,10 @@ mod tests {
         modified_ds.nodes[0][0] ^= 0x01;
         let root2 = compute_memory_commitment(&modified_ds);
 
-        assert_ne!(root1, root2, "Changing any node must change memory commitment");
+        assert_ne!(
+            root1, root2,
+            "Changing any node must change memory commitment"
+        );
     }
 
     // =============================================================================
@@ -1649,19 +1970,73 @@ mod tests {
     fn test_domain_separators_are_distinct() {
         let data = b"test data for domain separator";
 
-        let hash_epoch = blake3_256(&[DOMAIN_EPOCH, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_node = blake3_256(&[DOMAIN_NODE, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_seed = blake3_256(&[DOMAIN_SEED, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_cache = blake3_256(&[DOMAIN_CACHE, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_branch = blake3_256(&[DOMAIN_BRANCH, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_commitment = blake3_256(&[DOMAIN_COMMITMENT, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
-        let hash_memory = blake3_256(&[DOMAIN_MEMORY, data].iter().flat_map(|v| v.iter()).cloned().collect::<Vec<_>>());
+        let hash_epoch = blake3_256(
+            &[DOMAIN_EPOCH, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_node = blake3_256(
+            &[DOMAIN_NODE, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_seed = blake3_256(
+            &[DOMAIN_SEED, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_cache = blake3_256(
+            &[DOMAIN_CACHE, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_branch = blake3_256(
+            &[DOMAIN_BRANCH, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_commitment = blake3_256(
+            &[DOMAIN_COMMITMENT, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let hash_memory = blake3_256(
+            &[DOMAIN_MEMORY, data]
+                .iter()
+                .flat_map(|v| v.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
 
-        let hashes = [hash_epoch, hash_node, hash_seed, hash_cache, hash_branch, hash_commitment, hash_memory];
+        let hashes = [
+            hash_epoch,
+            hash_node,
+            hash_seed,
+            hash_cache,
+            hash_branch,
+            hash_commitment,
+            hash_memory,
+        ];
 
         for i in 0..hashes.len() {
-            for j in (i+1)..hashes.len() {
-                assert_ne!(hashes[i], hashes[j], "Domain separator {} must be distinct from {}", i, j);
+            for j in (i + 1)..hashes.len() {
+                assert_ne!(
+                    hashes[i], hashes[j],
+                    "Domain separator {} must be distinct from {}",
+                    i, j
+                );
             }
         }
     }
@@ -1729,7 +2104,11 @@ mod tests {
             }
             let hash_cow = evo_omap_hash(&mut ds_cow, header, height, nonce);
 
-            assert_eq!(hash_naive, hash_cow, "CoW must produce same result as naive for nonce {}", nonce);
+            assert_eq!(
+                hash_naive, hash_cow,
+                "CoW must produce same result as naive for nonce {}",
+                nonce
+            );
         }
     }
 
@@ -1798,7 +2177,9 @@ mod tests {
                 ds.set(i, base_ds.get(i).to_vec());
             }
             let hash = evo_omap_hash(&mut ds, header, height, nonce);
-            let leading_zeros = hash.0.iter()
+            let leading_zeros = hash
+                .0
+                .iter()
                 .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
                 .take_while(|&b| b == 0)
                 .count() as u64;
@@ -1808,7 +2189,10 @@ mod tests {
             }
         }
 
-        assert!(found_nonce.is_some(), "Failed to find valid nonce in 1M attempts");
+        assert!(
+            found_nonce.is_some(),
+            "Failed to find valid nonce in 1M attempts"
+        );
         let nonce = found_nonce.unwrap();
         assert!(verify(header, height, nonce, difficulty));
     }
@@ -1942,7 +2326,10 @@ mod tests {
         expected_data.extend_from_slice(&prefixed_domain(DOMAIN_EPOCH));
         expected_data.extend_from_slice(&0u64.to_le_bytes());
         let expected = blake3_256(&expected_data);
-        assert_eq!(seed, expected, "Epoch seed 0 must match prefixed-domain format");
+        assert_eq!(
+            seed, expected,
+            "Epoch seed 0 must match prefixed-domain format"
+        );
         assert_ne!(seed.0, [0u8; 32], "Epoch seed must not be zero");
     }
 
@@ -1978,13 +2365,10 @@ mod tests {
     #[test]
     fn test_state_as_u64_array() {
         let state = State([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
-            0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
-            0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33,
+            0x34, 0x35, 0x36, 0x37, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x50, 0x51,
+            0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
         ]);
         let arr = state.as_u64_array();
@@ -2037,7 +2421,10 @@ mod tests {
         let _hash = evo_omap_hash(&mut ds, header, height, nonce);
 
         let final_node_0 = ds.get(0).to_vec();
-        assert_ne!(original_node_0, final_node_0, "Dataset node should be modified after hash");
+        assert_ne!(
+            original_node_0, final_node_0,
+            "Dataset node should be modified after hash"
+        );
     }
 
     #[test]
@@ -2126,7 +2513,9 @@ mod tests {
                 ds.set(i, base_ds.get(i).to_vec());
             }
             let hash = evo_omap_hash(&mut ds, header, height, nonce);
-            let leading_zeros = hash.0.iter()
+            let leading_zeros = hash
+                .0
+                .iter()
                 .flat_map(|b| (0..8u32).rev().map(move |i| (b >> i) & 1))
                 .take_while(|&b| b == 0)
                 .count() as u64;
