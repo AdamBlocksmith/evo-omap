@@ -165,7 +165,9 @@ At each of `T = 4096` steps:
 
 ```
 state_summary = H(W)
-memory_commitment = H(prefixed(DOMAIN_MEMORY) ‖ Node[0] ‖ ... ‖ Node[N-1])
+leaf[i] = H(prefixed(DOMAIN_MEMORY) ‖ "leaf" ‖ i_u64_le ‖ len(Node[i])_u64_le ‖ Node[i])
+parent = H(prefixed(DOMAIN_MEMORY) ‖ "parent" ‖ left_hash ‖ right_hash)
+memory_commitment = MerkleRoot(leaf[0], ..., leaf[N-1])
 final_hash = SHA3-256(state_summary ‖ commitment_hash ‖ memory_commitment)
 ```
 
@@ -508,7 +510,7 @@ However, 256 MiB of high-bandwidth DRAM requires significant board area and powe
 
 ### 2. Light Client Trust
 
-Light clients verify using on-demand node reconstruction (`LightDataset`). `verify()` and `verify_light()` are guaranteed to agree: both compute the same final SHA3-256 hash for any given `(header, height, nonce)` tuple. The commitment scheme uses a linear hash (not a Merkle tree), so light clients cannot verify individual node inclusion without recomputing the full chain. Future work: implement a Merkle tree for O(log n) membership proofs.
+Light clients verify using on-demand node reconstruction (`LightDataset`). `verify()` and `verify_light()` are guaranteed to agree: both compute the same final SHA3-256 hash for any given `(header, height, nonce)` tuple. The memory commitment is a Merkle root over indexed node leaves, and the library exposes proof helpers for O(log n) node-membership proofs.
 
 ### 3. Big-Endian Platforms
 
@@ -549,11 +551,11 @@ use the `*_with_epoch_length_and_seed_material` APIs and pass chain-specific
 material such as `chain_id || parent_hash`. EVO-OMAP cannot choose that material
 itself because it is chain-state dependent.
 
-### Light Client Merkle Proofs
-The memory commitment uses a linear hash over all 256 nodes. Light 
-clients cannot verify individual node inclusion without recomputing 
-the full commitment chain. Future work: replace with a Merkle tree 
-for O(log n) membership proofs.
+### Light Client Proof Scope
+EVO-OMAP exposes Merkle membership proofs for committed memory nodes. Full PoW
+verification still requires executing the algorithm or using `verify_light()`;
+the Merkle proof helpers are for node-membership proofs against a committed
+memory root, not a standalone replacement for PoW execution.
 
 ### Network Security at Launch
 At current hashrates (~0.16-1.48 H/s per machine), a single 
@@ -592,7 +594,15 @@ Key innovations:
 
 ## Changelog
 
-### v0.2.1 (current)
+### v0.3.0 (current)
+- Replaced the linear memory commitment with a Merkle-root commitment over
+  indexed node leaves
+- Added `MemoryMerkleProof` / `MemoryMerkleSibling` plus proof generation and
+  verification helpers
+- This is a breaking PoW-output change and should be adopted only before chain
+  launch or with an explicit network upgrade
+
+### v0.2.1
 - Added custom epoch length APIs for blockchain integrations that use epoch
   lengths other than EVO-OMAP's 1024-block default
 - Added seed-material APIs so production chains can bind datasets to chain

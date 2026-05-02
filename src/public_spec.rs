@@ -282,9 +282,13 @@ pub const DOMAIN_BRANCH: &[u8] = b"evo_omap_branch";
 /// Format: "evo_omap_commitment" || height || state_prefix_0 || ...
 pub const DOMAIN_COMMITMENT: &[u8] = b"evo_omap_commitment";
 
-/// Domain separator for memory commitment.
+/// Domain separator for memory Merkle commitment.
 ///
-/// Format: "evo_omap_memory" || node_0 || node_1 || ... || node_n
+/// Leaf format:
+/// prefixed("evo_omap_memory") || "leaf" || index_u64_le || node_len_u64_le || node
+///
+/// Parent format:
+/// prefixed("evo_omap_memory") || "parent" || left_hash || right_hash
 pub const DOMAIN_MEMORY: &[u8] = b"evo_omap_memory";
 
 // =============================================================================

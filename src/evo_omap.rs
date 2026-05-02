@@ -82,6 +82,18 @@ pub struct Dataset {
     pub nodes: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MemoryMerkleSibling {
+    pub hash: Hash,
+    pub is_left: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MemoryMerkleProof {
+    pub leaf_index: usize,
+    pub siblings: Vec<MemoryMerkleSibling>,
+}
+
 impl Dataset {
     pub fn new() -> Self {
         Self {
@@ -243,16 +255,12 @@ impl LightDataset {
     }
 
     pub fn compute_memory_commitment(&mut self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&prefixed_domain(DOMAIN_MEMORY));
+        let mut leaves = Vec::with_capacity(NUM_NODES);
         for i in 0..NUM_NODES {
             let node = self.get_node(i);
-            hasher.update(&node);
+            leaves.push(compute_memory_leaf_hash(i, &node));
         }
-        let result = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(result.as_bytes());
-        Hash(arr)
+        compute_memory_merkle_root_from_leaves(leaves)
     }
 }
 
@@ -541,27 +549,122 @@ pub fn apply_branch(state: &mut State, step: u32, node1: &[u8], node2: &[u8]) {
 }
 
 pub fn compute_memory_commitment(dataset: &Dataset) -> Hash {
+    let nodes = dataset.as_node_slice();
+    compute_memory_commitment_from_slice(&nodes)
+}
+
+pub fn compute_memory_commitment_from_slice(nodes: &[&[u8]]) -> Hash {
+    let leaves = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| compute_memory_leaf_hash(index, node))
+        .collect();
+    compute_memory_merkle_root_from_leaves(leaves)
+}
+
+pub fn build_memory_merkle_proof_from_slice(
+    nodes: &[&[u8]],
+    leaf_index: usize,
+) -> Option<MemoryMerkleProof> {
+    if leaf_index >= nodes.len() {
+        return None;
+    }
+
+    let mut index = leaf_index;
+    let mut level: Vec<Hash> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| compute_memory_leaf_hash(index, node))
+        .collect();
+    let mut siblings = Vec::new();
+
+    while level.len() > 1 {
+        let sibling_index = if index % 2 == 0 {
+            (index + 1).min(level.len() - 1)
+        } else {
+            index - 1
+        };
+        siblings.push(MemoryMerkleSibling {
+            hash: level[sibling_index],
+            is_left: sibling_index < index,
+        });
+
+        level = merkle_parent_level(&level);
+        index /= 2;
+    }
+
+    Some(MemoryMerkleProof {
+        leaf_index,
+        siblings,
+    })
+}
+
+pub fn build_memory_merkle_proof(
+    dataset: &Dataset,
+    leaf_index: usize,
+) -> Option<MemoryMerkleProof> {
+    let nodes = dataset.as_node_slice();
+    build_memory_merkle_proof_from_slice(&nodes, leaf_index)
+}
+
+pub fn verify_memory_merkle_proof(root: &Hash, node: &[u8], proof: &MemoryMerkleProof) -> bool {
+    let mut current = compute_memory_leaf_hash(proof.leaf_index, node);
+    for sibling in &proof.siblings {
+        current = if sibling.is_left {
+            compute_memory_parent_hash(&sibling.hash, &current)
+        } else {
+            compute_memory_parent_hash(&current, &sibling.hash)
+        };
+    }
+    &current == root
+}
+
+fn compute_memory_leaf_hash(index: usize, node: &[u8]) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&prefixed_domain(DOMAIN_MEMORY));
-    for node in &dataset.nodes {
-        hasher.update(node);
-    }
+    hasher.update(b"leaf");
+    hasher.update(&(index as u64).to_le_bytes());
+    hasher.update(&(node.len() as u64).to_le_bytes());
+    hasher.update(node);
     let result = hasher.finalize();
     let mut arr = [0u8; 32];
     arr.copy_from_slice(result.as_bytes());
     Hash(arr)
 }
 
-pub fn compute_memory_commitment_from_slice(nodes: &[&[u8]]) -> Hash {
+fn compute_memory_parent_hash(left: &Hash, right: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&prefixed_domain(DOMAIN_MEMORY));
-    for node in nodes {
-        hasher.update(node);
-    }
+    hasher.update(b"parent");
+    hasher.update(left.as_ref());
+    hasher.update(right.as_ref());
     let result = hasher.finalize();
     let mut arr = [0u8; 32];
     arr.copy_from_slice(result.as_bytes());
     Hash(arr)
+}
+
+fn compute_memory_merkle_root_from_leaves(leaves: Vec<Hash>) -> Hash {
+    assert!(
+        !leaves.is_empty(),
+        "memory commitment requires at least one node"
+    );
+    let mut level = leaves;
+    while level.len() > 1 {
+        level = merkle_parent_level(&level);
+    }
+    level[0]
+}
+
+fn merkle_parent_level(level: &[Hash]) -> Vec<Hash> {
+    level
+        .chunks(2)
+        .map(|pair| {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            compute_memory_parent_hash(&left, &right)
+        })
+        .collect()
 }
 
 pub fn evo_omap_hash<D: DatasetLike>(
@@ -1842,22 +1945,37 @@ mod tests {
 
     #[test]
     fn test_memory_commitment_format() {
-        let seed = compute_epoch_seed(0);
-        let ds = generate_dataset(&seed);
+        let node_0 = b"node zero".as_slice();
+        let node_1 = b"node one".as_slice();
+        let node_2 = b"node two".as_slice();
+        let nodes = [node_0, node_1, node_2];
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&prefixed_domain(DOMAIN_MEMORY));
-        for node in &ds.nodes {
-            hasher.update(node);
-        }
-        let result = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(result.as_bytes());
-        let expected = Hash::from_bytes(arr);
+        let leaf_0 = compute_memory_leaf_hash(0, node_0);
+        let leaf_1 = compute_memory_leaf_hash(1, node_1);
+        let leaf_2 = compute_memory_leaf_hash(2, node_2);
+        let parent_0 = compute_memory_parent_hash(&leaf_0, &leaf_1);
+        let parent_1 = compute_memory_parent_hash(&leaf_2, &leaf_2);
+        let expected = compute_memory_parent_hash(&parent_0, &parent_1);
 
-        let computed = compute_memory_commitment(&ds);
+        let computed = compute_memory_commitment_from_slice(&nodes);
 
         assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn test_memory_merkle_proof_verifies_node_membership() {
+        let nodes: [&[u8]; 4] = [b"node 0", b"node 1", b"node 2", b"node 3"];
+        let root = compute_memory_commitment_from_slice(&nodes);
+        let proof = build_memory_merkle_proof_from_slice(&nodes, 2).unwrap();
+
+        assert!(verify_memory_merkle_proof(&root, nodes[2], &proof));
+        assert!(!verify_memory_merkle_proof(&root, b"tampered", &proof));
+    }
+
+    #[test]
+    fn test_memory_merkle_proof_rejects_out_of_range_index() {
+        let nodes: [&[u8]; 2] = [b"node 0", b"node 1"];
+        assert!(build_memory_merkle_proof_from_slice(&nodes, 2).is_none());
     }
 
     #[test]
